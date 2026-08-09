@@ -49,16 +49,17 @@ def main():
     #
     # IMPORTANT:
     #
-    # Rank 0 listens on all IPv4 adapters.
+    # host_name must be the real, routable address of the
+    # master for ALL ranks, including rank 0.
     #
-    # Ranks 1-3 connect specifically to the
-    # hotspot address of Lazzy_PC.
+    # "0.0.0.0" is only valid as a *bind* address on some
+    # platforms. On Windows, TCPStore performs a client-side
+    # connect/validate step even for the master, so setting
+    # host_name="0.0.0.0" makes rank 0 try to dial itself at
+    # 0.0.0.0:PORT -- which cannot resolve, and hangs until
+    # it times out (the gai error 11004 you saw).
     #
-    store_host = (
-        "0.0.0.0"
-        if rank == 0
-        else MASTER_ADDR
-    )
+    store_host = MASTER_ADDR
 
     print(
         f"[Rank {rank}] Creating TCPStore "
