@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 SAMPLE_RATE = 16000
 
+
+
 SEGMENT_SECONDS = 2
 
 SEGMENT_SAMPLES = (
