@@ -1,4 +1,5 @@
 import random
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -14,14 +15,15 @@ from torch.utils.data import (
 
 from config import (
     BATCH_SIZE,
+    DATALOADER_WORKERS,
     DATASET_MULTIPLIER,
     LIBRISPEECH_DIR,
     MUSAN_DIR,
     SAMPLE_RATE,
     SEGMENT_SAMPLES,
-    SEED,
     SNR_MAX_DB,
     SNR_MIN_DB,
+    VALIDATION_RATIO,
 )
 
 
@@ -35,9 +37,11 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 }
 
 
-def find_audio_files(folder):
+def find_audio_files(
+    folder: Path,
+):
     """
-    Recursively discover supported audio files.
+    Recursively find supported audio files.
     """
 
     folder = Path(folder)
@@ -60,16 +64,18 @@ def find_audio_files(folder):
 # AUDIO LOADING
 # ============================================================
 
-def load_audio(path):
+@lru_cache(maxsize=512)
+def load_audio_cached(
+    path_string,
+):
     """
-    Load an audio file and convert it to:
+    Load, mono-convert and resample audio.
 
-        float32
-        mono
-        SAMPLE_RATE
+    A bounded LRU cache is used so recently used audio files
+    don't have to be decoded repeatedly from disk.
     """
 
-    path = Path(path)
+    path = Path(path_string)
 
     audio, sample_rate = sf.read(
         path,
@@ -77,7 +83,7 @@ def load_audio(path):
     )
 
     # --------------------------------------------------------
-    # Convert stereo/multi-channel to mono
+    # Stereo -> mono
     # --------------------------------------------------------
 
     if audio.ndim == 2:
@@ -113,14 +119,12 @@ def load_audio(path):
             audio,
             SAMPLE_RATE,
             sample_rate,
-        )
-
-        audio = audio.astype(
+        ).astype(
             np.float32
         )
 
     # --------------------------------------------------------
-    # Prevent excessive amplitude
+    # Normalize only if necessary
     # --------------------------------------------------------
 
     if len(audio) > 0:
@@ -134,8 +138,7 @@ def load_audio(path):
         if peak > 1.0:
 
             audio = (
-                audio
-                / peak
+                audio / peak
             )
 
     return audio.astype(
@@ -143,11 +146,25 @@ def load_audio(path):
     )
 
 
+def load_audio(path):
+    """
+    Public audio-loading function.
+    """
+
+    return load_audio_cached(
+        str(
+            Path(path).resolve()
+        )
+    ).copy()
+
+
 # ============================================================
 # RANDOM SEGMENT
 # ============================================================
 
-def random_segment(audio):
+def random_segment(
+    audio,
+):
     """
     Return exactly SEGMENT_SAMPLES samples.
     """
@@ -190,7 +207,12 @@ def random_segment(audio):
 # NOISE PREPARATION
 # ============================================================
 
-def prepare_noise(noise):
+def prepare_noise(
+    noise,
+):
+    """
+    Prepare exactly SEGMENT_SAMPLES of noise.
+    """
 
     if len(noise) == 0:
 
@@ -223,7 +245,7 @@ def prepare_noise(noise):
 
 
 # ============================================================
-# MIX CLEAN + NOISE
+# MIX AUDIO
 # ============================================================
 
 def mix_at_snr(
@@ -231,6 +253,9 @@ def mix_at_snr(
     noise,
     snr_db,
 ):
+    """
+    Mix speech and noise at the requested SNR.
+    """
 
     clean = clean.astype(
         np.float32
@@ -280,6 +305,10 @@ def mix_at_snr(
         + scaled_noise
     )
 
+    # --------------------------------------------------------
+    # Prevent clipping
+    # --------------------------------------------------------
+
     peak = float(
         np.max(
             np.abs(noisy)
@@ -289,35 +318,32 @@ def mix_at_snr(
     if peak > 0.99:
 
         scale = (
-            0.99
-            / peak
+            0.99 / peak
         )
 
         noisy *= scale
         clean *= scale
 
     return (
-        noisy.astype(
-            np.float32
-        ),
-        clean.astype(
-            np.float32
-        ),
+        noisy.astype(np.float32),
+        clean.astype(np.float32),
     )
 
 
 # ============================================================
-# DATASET
+# AUDIO DATASET
 # ============================================================
 
-class SHAAudioDataset(Dataset):
+class SHAAudioDataset(
+    Dataset
+):
 
     def __init__(
         self,
         clean_files,
         noise_files,
         multiplier=DATASET_MULTIPLIER,
-        validation=False,
+        deterministic=False,
     ):
 
         self.clean_files = list(
@@ -333,8 +359,8 @@ class SHAAudioDataset(Dataset):
             1,
         )
 
-        self.validation = (
-            validation
+        self.deterministic = (
+            deterministic
         )
 
         if not self.clean_files:
@@ -361,12 +387,16 @@ class SHAAudioDataset(Dataset):
         index,
     ):
 
+        clean_index = (
+            index
+            % len(
+                self.clean_files
+            )
+        )
+
         clean_path = (
             self.clean_files[
-                index
-                % len(
-                    self.clean_files
-                )
+                clean_index
             ]
         )
 
@@ -374,7 +404,7 @@ class SHAAudioDataset(Dataset):
         # Deterministic validation
         # ----------------------------------------------------
 
-        if self.validation:
+        if self.deterministic:
 
             noise_index = (
                 index
@@ -389,15 +419,44 @@ class SHAAudioDataset(Dataset):
                 ]
             )
 
-            clean = load_audio(
-                clean_path
+            rng = random.Random(
+                index + 12345
             )
 
-            noise = load_audio(
-                noise_path
+            snr_db = rng.uniform(
+                SNR_MIN_DB,
+                SNR_MAX_DB,
             )
 
-            # Deterministic segment.
+        else:
+
+            noise_path = random.choice(
+                self.noise_files
+            )
+
+            snr_db = random.uniform(
+                SNR_MIN_DB,
+                SNR_MAX_DB,
+            )
+
+        # ----------------------------------------------------
+        # Load cached audio
+        # ----------------------------------------------------
+
+        clean = load_audio(
+            clean_path
+        )
+
+        noise = load_audio(
+            noise_path
+        )
+
+        # ----------------------------------------------------
+        # Segment
+        # ----------------------------------------------------
+
+        if self.deterministic:
+
             if len(clean) >= SEGMENT_SAMPLES:
 
                 max_start = (
@@ -423,45 +482,29 @@ class SHAAudioDataset(Dataset):
                     clean
                 )
 
-            noise = prepare_noise(
-                noise
-            )
-
-            # Fixed validation SNR.
-            snr_db = 5.0
-
         else:
-
-            noise_path = random.choice(
-                self.noise_files
-            )
-
-            clean = load_audio(
-                clean_path
-            )
-
-            noise = load_audio(
-                noise_path
-            )
 
             clean = random_segment(
                 clean
             )
 
-            noise = prepare_noise(
-                noise
-            )
+        noise = prepare_noise(
+            noise
+        )
 
-            snr_db = random.uniform(
-                SNR_MIN_DB,
-                SNR_MAX_DB,
-            )
+        # ----------------------------------------------------
+        # Mix
+        # ----------------------------------------------------
 
         noisy, clean = mix_at_snr(
             clean,
             noise,
             snr_db,
         )
+
+        # ----------------------------------------------------
+        # Tensor
+        # ----------------------------------------------------
 
         noisy_tensor = (
             torch.from_numpy(
@@ -484,63 +527,51 @@ class SHAAudioDataset(Dataset):
 
 
 # ============================================================
-# SPLIT LOCAL DATASET
+# DATASET SPLIT
 # ============================================================
 
 def split_files(
-    files,
-    validation_ratio=0.2,
+    clean_files,
+    validation_ratio=VALIDATION_RATIO,
 ):
     """
-    Split the LOCAL clean dataset.
-
-    Every PC performs this independently.
-
-    80% -> training
-    20% -> validation
+    Split clean files into training and validation files.
     """
 
-    files = list(files)
+    files = list(
+        clean_files
+    )
 
     if len(files) < 2:
 
-        return files, files
+        return (
+            files,
+            files,
+        )
 
     rng = random.Random(
-        SEED
+        42
     )
 
-    shuffled = list(files)
-
     rng.shuffle(
-        shuffled
+        files
     )
 
     validation_count = max(
         1,
         int(
-            len(shuffled)
+            len(files)
             * validation_ratio
         ),
     )
 
-    validation_files = (
-        shuffled[
-            :validation_count
-        ]
-    )
+    validation_files = files[
+        :validation_count
+    ]
 
-    training_files = (
-        shuffled[
-            validation_count:
-        ]
-    )
-
-    if not training_files:
-
-        training_files = (
-            validation_files
-        )
+    training_files = files[
+        validation_count:
+    ]
 
     return (
         training_files,
@@ -549,20 +580,42 @@ def split_files(
 
 
 # ============================================================
-# LOCAL DATALOADERS
+# DATASET INFORMATION
+# ============================================================
+
+def discover_local_files():
+
+    clean_files = find_audio_files(
+        LIBRISPEECH_DIR
+    )
+
+    noise_files = find_audio_files(
+        MUSAN_DIR
+    )
+
+    return (
+        clean_files,
+        noise_files,
+    )
+
+
+# ============================================================
+# LOCAL LOADERS
 # ============================================================
 
 def get_local_loaders(
-    participant_id="HOST",
+    participant_id,
     batch_size=BATCH_SIZE,
 ):
     """
-    Build training and validation loaders from:
+    Build local train/validation loaders.
 
-        sources/librispeech
-        sources/musan
+    IMPORTANT:
 
-    on the CURRENT machine.
+    This function only accesses the local PC's:
+
+        datasets/anc/sources/librispeech
+        datasets/anc/sources/musan
     """
 
     clean_dir = Path(
@@ -572,6 +625,33 @@ def get_local_loaders(
     noise_dir = Path(
         MUSAN_DIR
     )
+
+    print()
+    print(
+        "-" * 70
+    )
+
+    print(
+        f"[{participant_id}] LOCAL DATASET"
+    )
+
+    print(
+        "-" * 70
+    )
+
+    print(
+        f"LibriSpeech : "
+        f"{clean_dir}"
+    )
+
+    print(
+        f"MUSAN       : "
+        f"{noise_dir}"
+    )
+
+    # --------------------------------------------------------
+    # Validate directories
+    # --------------------------------------------------------
 
     if not clean_dir.exists():
 
@@ -588,6 +668,10 @@ def get_local_loaders(
             f"MUSAN directory does not exist:\n"
             f"{noise_dir}"
         )
+
+    # --------------------------------------------------------
+    # Discover files
+    # --------------------------------------------------------
 
     clean_files = find_audio_files(
         clean_dir
@@ -611,6 +695,10 @@ def get_local_loaders(
             "No MUSAN audio files found."
         )
 
+    # --------------------------------------------------------
+    # Split
+    # --------------------------------------------------------
+
     (
         training_files,
         validation_files,
@@ -618,85 +706,132 @@ def get_local_loaders(
         clean_files
     )
 
-    print()
-    print(
-        "-" * 70
+    training_dataset = (
+        SHAAudioDataset(
+            clean_files=training_files,
+            noise_files=noise_files,
+            multiplier=DATASET_MULTIPLIER,
+            deterministic=False,
+        )
     )
 
-    print(
-        f"[{participant_id}] LOCAL DATASET"
+    validation_dataset = (
+        SHAAudioDataset(
+            clean_files=validation_files,
+            noise_files=noise_files,
+            multiplier=1,
+            deterministic=True,
+        )
     )
 
-    print(
-        "-" * 70
-    )
+    # --------------------------------------------------------
+    # DataLoader
+    # --------------------------------------------------------
 
-    print(
-        f"LibriSpeech : {clean_dir}"
-    )
+    # num_workers=2 is intentionally conservative for
+    # Windows. Change to 0 if multiprocessing causes issues.
 
-    print(
-        f"MUSAN       : {noise_dir}"
-    )
-
-    print(
-        f"Clean files : {len(clean_files)}"
-    )
-
-    print(
-        f"Noise files : {len(noise_files)}"
-    )
-
-    print(
-        f"Training    : {len(training_files)}"
-    )
-
-    print(
-        f"Validation  : {len(validation_files)}"
-    )
-
-    print(
-        f"Multiplier  : {DATASET_MULTIPLIER}"
-    )
-
-    print(
-        "-" * 70
-    )
-
-    train_dataset = SHAAudioDataset(
-        clean_files=training_files,
-        noise_files=noise_files,
-        multiplier=DATASET_MULTIPLIER,
-        validation=False,
-    )
-
-    validation_dataset = SHAAudioDataset(
-        clean_files=validation_files,
-        noise_files=noise_files,
-        multiplier=max(
-            2,
-            DATASET_MULTIPLIER // 2,
-        ),
-        validation=True,
+    loader_workers = max(
+        int(DATALOADER_WORKERS),
+        0,
     )
 
     train_loader = DataLoader(
-        train_dataset,
+        training_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=loader_workers,
+        pin_memory=torch.cuda.is_available(),
         drop_last=False,
+        persistent_workers=(
+            loader_workers > 0
+        ),
     )
 
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=loader_workers,
+        pin_memory=torch.cuda.is_available(),
         drop_last=False,
+        persistent_workers=(
+            loader_workers > 0
+        ),
+    )
+
+    print(
+        f"Clean files : "
+        f"{len(clean_files)}"
+    )
+
+    print(
+        f"Noise files : "
+        f"{len(noise_files)}"
+    )
+
+    print(
+        f"Training    : "
+        f"{len(training_files)}"
+    )
+
+    print(
+        f"Validation  : "
+        f"{len(validation_files)}"
+    )
+
+    print(
+        f"Multiplier  : "
+        f"{DATASET_MULTIPLIER}"
+    )
+
+    print(
+        f"Train examples: "
+        f"{len(training_dataset)}"
+    )
+
+    print(
+        f"Validation examples: "
+        f"{len(validation_dataset)}"
+    )
+
+    print(
+        f"DataLoader workers: "
+        f"{loader_workers}"
+    )
+
+    print(
+        "-" * 70
     )
 
     return (
         train_loader,
         validation_loader,
     )
+
+
+# ============================================================
+# BACKWARD COMPATIBILITY
+# ============================================================
+
+def get_worker_loader(
+    worker_id,
+    num_workers=None,
+    batch_size=BATCH_SIZE,
+):
+    """
+    Compatibility wrapper.
+
+    Existing code that expects get_worker_loader()
+    can continue to work.
+    """
+
+    (
+        train_loader,
+        _,
+    ) = get_local_loaders(
+        participant_id=f"WORKER {worker_id}",
+        batch_size=batch_size,
+    )
+
+    return train_loader

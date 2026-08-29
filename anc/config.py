@@ -1,4 +1,3 @@
-
 import os
 from pathlib import Path
 
@@ -11,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 # ============================================================
-# AUDIO CONFIGURATION
+# AUDIO
 # ============================================================
 
 SAMPLE_RATE = 16000
@@ -19,38 +18,45 @@ SAMPLE_RATE = 16000
 SEGMENT_SECONDS = 2
 
 SEGMENT_SAMPLES = (
-    SAMPLE_RATE
-    * SEGMENT_SECONDS
+    SAMPLE_RATE * SEGMENT_SECONDS
 )
 
 
 # ============================================================
-# LOCAL DATASET
+# LOCAL DATA SOURCES
 #
-# EVERY PARTICIPANT HAS ITS OWN:
+# EVERY PC MUST HAVE:
 #
-# sources/
-# ├── librispeech/
-# └── musan/
+# SHA_AI/
+# └── datasets/
+#     └── anc/
+#         └── sources/
+#             ├── librispeech/
+#             └── musan/
 #
-# No participant reads another participant's dataset.
+# The data remains local to each participant.
 # ============================================================
 
-SOURCES_DIR = ROOT / "sources"
+SOURCES_DIR = (
+    ROOT
+    / "datasets"
+    / "anc"
+    / "sources"
+)
 
 LIBRISPEECH_DIR = (
-    SOURCES_DIR / "librispeech"
+    SOURCES_DIR
+    / "librispeech"
 )
 
 MUSAN_DIR = (
-    SOURCES_DIR / "musan"
+    SOURCES_DIR
+    / "musan"
 )
 
 
 # ------------------------------------------------------------
-# Optional environment overrides
-#
-# Useful if a particular PC stores sources elsewhere.
+# Optional override
 # ------------------------------------------------------------
 
 if os.environ.get("SHA_SOURCES_DIR"):
@@ -60,11 +66,13 @@ if os.environ.get("SHA_SOURCES_DIR"):
     )
 
     LIBRISPEECH_DIR = (
-        SOURCES_DIR / "librispeech"
+        SOURCES_DIR
+        / "librispeech"
     )
 
     MUSAN_DIR = (
-        SOURCES_DIR / "musan"
+        SOURCES_DIR
+        / "musan"
     )
 
 
@@ -72,10 +80,10 @@ if os.environ.get("SHA_SOURCES_DIR"):
 # FEDERATED PARTICIPANTS
 # ============================================================
 
-# There are TWO remote workers.
+# TWO REMOTE WORKERS
 DEFAULT_WORKERS = 2
 
-# Host + Worker 1 + Worker 2
+# HOST + WORKER 1 + WORKER 2
 NUM_PARTICIPANTS = (
     DEFAULT_WORKERS + 1
 )
@@ -85,7 +93,7 @@ NUM_PARTICIPANTS = (
 # NETWORK
 # ============================================================
 
-HOST_IP = "10.187.224.242"
+HOST_IP = "10.178.216.99"
 
 DEFAULT_PORT = 8080
 
@@ -94,42 +102,57 @@ DEFAULT_PORT = 8080
 # TRAINING
 # ============================================================
 
-BATCH_SIZE = 8
+# Increased from 8 to reduce number of optimizer steps.
+BATCH_SIZE = 16
 
 EPOCHS = 30
 
 LEARNING_RATE = 1e-3
 
 
+# ------------------------------------------------------------
+# DataLoader workers
+#
+# Windows:
+# Start conservatively with 2.
+# ------------------------------------------------------------
+
+DATALOADER_WORKERS = 2
+
+
 # ============================================================
 # DATA GENERATION
 # ============================================================
+
+# Reduced from 8 for the initial demonstration.
+#
+# Change to 4 or 8 later for a larger experiment.
+DATASET_MULTIPLIER = 2
 
 SNR_MIN_DB = -10
 
 SNR_MAX_DB = 15
 
-DATASET_MULTIPLIER = 8
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+VALIDATION_RATIO = 0.20
 
 
 # ============================================================
-# EARLY STOPPING
+# PARTICIPANT EARLY STOPPING
 # ============================================================
-
-# Minimum validation-loss improvement required to reset
-# the participant patience counter.
 
 MIN_IMPROVEMENT = 0.0005
-
-# Number of consecutive rounds without sufficient
-# improvement before participant convergence.
 
 PATIENCE = 4
 
 
-# ------------------------------------------------------------
+# ============================================================
 # GLOBAL EARLY STOPPING
-# ------------------------------------------------------------
+# ============================================================
 
 GLOBAL_MIN_IMPROVEMENT = 0.0005
 
@@ -162,4 +185,3 @@ GLOBAL_MODEL_PATH = (
 # ============================================================
 
 SEED = 42
-
