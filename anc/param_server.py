@@ -1,11 +1,9 @@
 import argparse
 import pickle
-import random
 import socket
 import threading
 import time
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -20,28 +18,40 @@ from config import (
     GLOBAL_PATIENCE,
     LEARNING_RATE,
     MIN_IMPROVEMENT,
-    PATIENCE,
+    NUM_PARTICIPANTS,
 )
 
-from dataset import (
-    get_local_loaders,
-)
-
+from dataset import get_local_loaders
 from model import create_model
 
 
 # ============================================================
-# REPRODUCIBILITY
+# S.H.A ANC FEDERATED PARAMETER SERVER
+#
+# Architecture
+#
+#                 HOST
+#          ┌───────┴────────┐
+#          │                │
+#     LOCAL TRAINING   PARAMETER SERVER
+#                           │
+#                    ┌──────┴──────┐
+#                    │             │
+#                 WORKER 1      WORKER 2
+#
+# Participants:
+#
+#     HOST + WORKER 1 + WORKER 2 = 3
+#
+# The host is BOTH:
+#
+#     1. Parameter server
+#     2. Training participant
+#
+# Each participant keeps its own LibriSpeech/MUSAN dataset.
+# Only model weights and metrics are exchanged.
 # ============================================================
 
-random.seed(42)
-np.random.seed(42)
-torch.manual_seed(42)
-
-
-# ============================================================
-# PARAMETER SERVER + HOST PARTICIPANT
-# ============================================================
 
 class SHAANCParameterServer:
 
@@ -52,26 +62,47 @@ class SHAANCParameterServer:
         epochs,
         batch_size=BATCH_SIZE,
         learning_rate=LEARNING_RATE,
-        participant_patience=PATIENCE,
-        participant_min_improvement=MIN_IMPROVEMENT,
+        participant_patience=MIN_IMPROVEMENT,
         global_patience=GLOBAL_PATIENCE,
-        global_min_improvement=GLOBAL_MIN_IMPROVEMENT,
     ):
+
+        # ----------------------------------------------------
+        # Configuration
+        # ----------------------------------------------------
 
         self.port = port
 
         self.num_workers = num_workers
 
-        self.num_participants = (
-            num_workers + 1
-        )
+        self.num_participants = num_workers + 1
 
         self.epochs = epochs
 
         self.batch_size = batch_size
 
-        self.learning_rate = (
-            learning_rate
+        self.learning_rate = learning_rate
+
+        self.min_improvement = MIN_IMPROVEMENT
+
+        self.participant_patience = (
+            max(
+                int(
+                    GLOBAL_PATIENCE
+                ),
+                1,
+            )
+            if participant_patience is None
+            else max(
+                int(
+                    participant_patience
+                ),
+                1,
+            )
+        )
+
+        self.global_patience = max(
+            int(global_patience),
+            1,
         )
 
         # ----------------------------------------------------
@@ -80,78 +111,26 @@ class SHAANCParameterServer:
 
         self.model = create_model()
 
+        self.criterion = nn.L1Loss()
+
         # ----------------------------------------------------
-        # Host local training
+        # Host optimizer
+        #
+        # The HOST is now a real training participant.
         # ----------------------------------------------------
 
-        self.host_criterion = nn.L1Loss()
-
-        self.host_optimizer = optim.AdamW(
+        self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.learning_rate,
         )
 
+        # ----------------------------------------------------
+        # Host dataset
+        # ----------------------------------------------------
+
         self.host_train_loader = None
 
         self.host_validation_loader = None
-
-        self.host_best_validation_loss = (
-            float("inf")
-        )
-
-        self.host_previous_validation_loss = (
-            None
-        )
-
-        self.host_epochs_without_improvement = 0
-
-        self.host_converged = False
-
-        self.host_convergence_epoch = None
-
-        self.host_last_loss = float("inf")
-
-        self.host_last_validation_loss = (
-            float("inf")
-        )
-
-        # ----------------------------------------------------
-        # Participant early stopping
-        # ----------------------------------------------------
-
-        self.participant_patience = max(
-            int(participant_patience),
-            1,
-        )
-
-        self.participant_min_improvement = (
-            float(
-                participant_min_improvement
-            )
-        )
-
-        # ----------------------------------------------------
-        # Global early stopping
-        # ----------------------------------------------------
-
-        self.global_patience = max(
-            int(global_patience),
-            1,
-        )
-
-        self.global_min_improvement = (
-            float(
-                global_min_improvement
-            )
-        )
-
-        self.global_epochs_without_improvement = (
-            0
-        )
-
-        self.best_global_validation_loss = (
-            float("inf")
-        )
 
         # ----------------------------------------------------
         # Network
@@ -165,13 +144,19 @@ class SHAANCParameterServer:
         # Worker state
         # ----------------------------------------------------
 
-        self.ready_workers = set()
+        self.worker_ready = set()
 
         self.active_workers = set()
 
         self.stopped_workers = set()
 
-        self.worker_updates = {}
+        self.worker_connections = {}
+
+        # ----------------------------------------------------
+        # Current round updates
+        # ----------------------------------------------------
+
+        self.updates = {}
 
         # ----------------------------------------------------
         # Synchronization
@@ -179,7 +164,39 @@ class SHAANCParameterServer:
 
         self.lock = threading.Lock()
 
+        self.ready_condition = threading.Condition(
+            self.lock
+        )
+
+        self.update_condition = threading.Condition(
+            self.lock
+        )
+
+        # ----------------------------------------------------
+        # Training state
+        # ----------------------------------------------------
+
         self.training_complete = False
+
+        self.global_best_validation_loss = float(
+            "inf"
+        )
+
+        self.global_epochs_without_improvement = 0
+
+        # ----------------------------------------------------
+        # Host early stopping
+        # ----------------------------------------------------
+
+        self.host_best_validation_loss = float(
+            "inf"
+        )
+
+        self.host_epochs_without_improvement = 0
+
+        self.host_converged = False
+
+        self.host_convergence_epoch = None
 
     # ========================================================
     # NETWORK HELPERS
@@ -191,9 +208,7 @@ class SHAANCParameterServer:
         data,
     ):
 
-        header = len(
-            data
-        ).to_bytes(
+        header = len(data).to_bytes(
             8,
             "big",
         )
@@ -226,7 +241,7 @@ class SHAANCParameterServer:
             if not chunk:
 
                 raise ConnectionError(
-                    "Worker connection closed."
+                    "Connection closed."
                 )
 
             buffer.extend(
@@ -256,7 +271,7 @@ class SHAANCParameterServer:
         if size <= 0:
 
             raise ConnectionError(
-                "Invalid message size."
+                "Invalid payload size."
             )
 
         return cls.recv_exact(
@@ -265,158 +280,20 @@ class SHAANCParameterServer:
         )
 
     # ========================================================
-    # SEND MESSAGE
+    # SERIALIZATION
     # ========================================================
 
-    def send_message(
-        self,
-        sock,
-        message,
+    @staticmethod
+    def model_state_dict(
+        model,
     ):
 
-        payload = pickle.dumps(
-            message,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-
-        self.send_bytes(
-            sock,
-            payload,
-        )
-
-    # ========================================================
-    # WORKER HANDLER
-    # ========================================================
-
-    def handle_worker(
-        self,
-        worker_id,
-        sock,
-    ):
-
-        try:
-
-            while True:
-
-                payload = self.recv_bytes(
-                    sock
-                )
-
-                message = pickle.loads(
-                    payload
-                )
-
-                message_type = message.get(
-                    "type"
-                )
-
-                # --------------------------------------------
-                # READY
-                # --------------------------------------------
-
-                if message_type == "READY":
-
-                    with self.lock:
-
-                        self.ready_workers.add(
-                            worker_id
-                        )
-
-                        self.active_workers.add(
-                            worker_id
-                        )
-
-                    print()
-
-                    print(
-                        f"[Server] Worker "
-                        f"{worker_id} is READY."
-                    )
-
-                    continue
-
-                # --------------------------------------------
-                # MODEL UPDATE
-                # --------------------------------------------
-
-                if (
-                    message_type
-                    == "MODEL_UPDATE"
-                ):
-
-                    round_number = int(
-                        message.get(
-                            "round",
-                            0,
-                        )
-                    )
-
-                    with self.lock:
-
-                        self.worker_updates[
-                            worker_id
-                        ] = message
-
-                        status = message.get(
-                            "status",
-                            "TRAINING",
-                        )
-
-                        if status == "CONVERGED":
-
-                            self.stopped_workers.add(
-                                worker_id
-                            )
-
-                        # IMPORTANT:
-                        #
-                        # A converged worker remains an
-                        # active federated participant.
-                        #
-                        # It continues receiving the global
-                        # model and contributing its latest
-                        # model.
-
-                        self.active_workers.add(
-                            worker_id
-                        )
-
-                    print()
-
-                    print(
-                        f"[Server] Worker "
-                        f"{worker_id} submitted "
-                        f"round {round_number} update."
-                    )
-
-                    continue
-
-                # --------------------------------------------
-                # UNKNOWN
-                # --------------------------------------------
-
-                print(
-                    f"[Server] Worker "
-                    f"{worker_id} sent unknown "
-                    f"message type: "
-                    f"{message_type}"
-                )
-
-        except Exception as error:
-
-            print()
-
-            print(
-                f"[Server] Worker "
-                f"{worker_id} connection ended: "
-                f"{error}"
-            )
-
-            with self.lock:
-
-                self.active_workers.discard(
-                    worker_id
-                )
+        return {
+            key:
+                value.detach().cpu()
+            for key, value
+            in model.state_dict().items()
+        }
 
     # ========================================================
     # PREPARE HOST DATASET
@@ -425,15 +302,12 @@ class SHAANCParameterServer:
     def prepare_host_dataset(self):
 
         print()
-
         print(
             "=" * 70
         )
-
         print(
             "PREPARING HOST LOCAL DATASET"
         )
-
         print(
             "=" * 70
         )
@@ -446,11 +320,24 @@ class SHAANCParameterServer:
             batch_size=self.batch_size,
         )
 
+        print()
+        print(
+            "[HOST] Local dataset ready."
+        )
+
     # ========================================================
-    # HOST LOCAL TRAINING
+    # HOST TRAINING
     # ========================================================
 
-    def train_host_local_epoch(self):
+    def train_host_epoch(
+        self,
+    ):
+
+        if self.host_train_loader is None:
+
+            raise RuntimeError(
+                "Host dataset has not been prepared."
+            )
 
         self.model.train()
 
@@ -460,11 +347,9 @@ class SHAANCParameterServer:
 
         start_time = time.time()
 
-        for noisy, clean in (
-            self.host_train_loader
-        ):
+        for noisy, clean in self.host_train_loader:
 
-            self.host_optimizer.zero_grad(
+            self.optimizer.zero_grad(
                 set_to_none=True
             )
 
@@ -472,7 +357,7 @@ class SHAANCParameterServer:
                 noisy
             )
 
-            loss = self.host_criterion(
+            loss = self.criterion(
                 enhanced,
                 clean,
             )
@@ -484,7 +369,7 @@ class SHAANCParameterServer:
                 max_norm=5.0,
             )
 
-            self.host_optimizer.step()
+            self.optimizer.step()
 
             total_loss += float(
                 loss.item()
@@ -516,7 +401,13 @@ class SHAANCParameterServer:
     # ========================================================
 
     @torch.no_grad()
-    def validate_host(self):
+    def validate_host(
+        self,
+    ):
+
+        if self.host_validation_loader is None:
+
+            return 0.0
 
         self.model.eval()
 
@@ -524,15 +415,13 @@ class SHAANCParameterServer:
 
         batches = 0
 
-        for noisy, clean in (
-            self.host_validation_loader
-        ):
+        for noisy, clean in self.host_validation_loader:
 
             enhanced = self.model(
                 noisy
             )
 
-            loss = self.host_criterion(
+            loss = self.criterion(
                 enhanced,
                 clean,
             )
@@ -555,36 +444,32 @@ class SHAANCParameterServer:
     # HOST EARLY STOPPING
     # ========================================================
 
-    def check_host_early_stopping(
+    def check_host_convergence(
         self,
         validation_loss,
         epoch,
     ):
 
-        if (
-            validation_loss
-            <
+        improvement = (
             self.host_best_validation_loss
-            - self.participant_min_improvement
+            - validation_loss
+        )
+
+        if validation_loss < (
+            self.host_best_validation_loss
         ):
 
             self.host_best_validation_loss = (
                 validation_loss
             )
 
-            self.host_epochs_without_improvement = 0
+        if improvement >= self.min_improvement:
 
-            improved = True
+            self.host_epochs_without_improvement = 0
 
         else:
 
             self.host_epochs_without_improvement += 1
-
-            improved = False
-
-        self.host_previous_validation_loss = (
-            validation_loss
-        )
 
         if (
             self.host_epochs_without_improvement
@@ -593,115 +478,67 @@ class SHAANCParameterServer:
 
             self.host_converged = True
 
-            self.host_convergence_epoch = (
-                epoch
-            )
+            self.host_convergence_epoch = epoch
 
-        return improved
+            return True
+
+        return False
 
     # ========================================================
-    # HOST UPDATE
+    # SEND MESSAGE TO WORKER
     # ========================================================
 
-    def create_host_update(
+    def send_message(
         self,
-        epoch,
-        loss,
-        validation_loss,
-        elapsed,
-        batches,
+        sock,
+        message,
     ):
 
-        weights = {
-            key:
-                value.detach().cpu()
-            for key, value
-            in self.model.state_dict().items()
-        }
+        payload = pickle.dumps(
+            message,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
 
-        return {
-
-            "type":
-                "MODEL_UPDATE",
-
-            "worker_id":
-                0,
-
-            "participant":
-                "HOST",
-
-            "round":
-                epoch,
-
-            "loss":
-                float(loss),
-
-            "validation_loss":
-                float(validation_loss),
-
-            "status":
-                (
-                    "CONVERGED"
-                    if self.host_converged
-                    else "TRAINING"
-                ),
-
-            "convergence_epoch":
-                self.host_convergence_epoch,
-
-            "training_time":
-                float(elapsed),
-
-            "batches":
-                int(batches),
-
-            "weights":
-                weights,
-        }
+        self.send_bytes(
+            sock,
+            payload,
+        )
 
     # ========================================================
     # BROADCAST GLOBAL MODEL
     # ========================================================
 
-    def broadcast_global_model(
+    def broadcast_model(
         self,
         epoch,
     ):
 
-        state = {
-            key:
-                value.detach().cpu()
-            for key, value
-            in self.model.state_dict().items()
-        }
+        state = self.model_state_dict(
+            self.model
+        )
 
         message = {
-
-            "type":
-                "GLOBAL_MODEL",
-
-            "round":
-                epoch,
-
-            "weights":
-                state,
+            "type": "GLOBAL_MODEL",
+            "epoch": epoch,
+            "weights": state,
         }
 
         with self.lock:
 
-            workers_snapshot = dict(
-                self.workers
-            )
-
-        print()
+            workers_snapshot = {
+                worker_id: sock
+                for worker_id, sock
+                in self.workers.items()
+                if worker_id
+                in self.active_workers
+            }
 
         print(
-            "Broadcasting global model..."
+            f"Sending global model to "
+            f"{len(workers_snapshot)} workers..."
         )
 
-        for worker_id, sock in (
-            workers_snapshot.items()
-        ):
+        for worker_id, sock in workers_snapshot.items():
 
             try:
 
@@ -710,18 +547,12 @@ class SHAANCParameterServer:
                     message,
                 )
 
-                print(
-                    f"  Global model sent "
-                    f"to Worker {worker_id}"
-                )
-
             except Exception as error:
 
                 print(
-                    f"[Server] Failed to send "
+                    f"[Server] Could not send "
                     f"global model to Worker "
-                    f"{worker_id}: "
-                    f"{error}"
+                    f"{worker_id}: {error}"
                 )
 
                 with self.lock:
@@ -731,85 +562,190 @@ class SHAANCParameterServer:
                     )
 
     # ========================================================
-    # WAIT FOR READY
+    # WORKER CONNECTION HANDLER
     # ========================================================
 
-    def wait_for_all_workers_ready(
+    def handle_worker(
         self,
-        timeout=1800,
+        worker_id,
+        sock,
     ):
 
-        print()
+        try:
 
-        print(
-            "=" * 70
-        )
+            while True:
 
-        print(
-            "WAITING FOR ALL WORKERS TO BE READY"
-        )
+                payload = self.recv_bytes(
+                    sock
+                )
 
-        print(
-            "=" * 70
-        )
+                message = pickle.loads(
+                    payload
+                )
+
+                message_type = message.get(
+                    "type"
+                )
+
+                # ------------------------------------------------
+                # READY MESSAGE
+                # ------------------------------------------------
+
+                if message_type == "READY":
+
+                    with self.ready_condition:
+
+                        self.worker_ready.add(
+                            worker_id
+                        )
+
+                        self.active_workers.add(
+                            worker_id
+                        )
+
+                        print()
+                        print(
+                            f"[Server] Worker "
+                            f"{worker_id} is READY."
+                        )
+
+                        print(
+                            f"[Server] Ready workers: "
+                            f"{len(self.worker_ready)}/"
+                            f"{self.num_workers}"
+                        )
+
+                        self.ready_condition.notify_all()
+
+                # ------------------------------------------------
+                # MODEL UPDATE
+                # ------------------------------------------------
+
+                elif message_type == "UPDATE":
+
+                    with self.update_condition:
+
+                        self.updates[
+                            worker_id
+                        ] = message
+
+                        status = message.get(
+                            "status",
+                            "TRAINING",
+                        )
+
+                        if status == "CONVERGED":
+
+                            self.stopped_workers.add(
+                                worker_id
+                            )
+
+                            self.active_workers.discard(
+                                worker_id
+                            )
+
+                        else:
+
+                            self.active_workers.add(
+                                worker_id
+                            )
+
+                        print()
+                        print(
+                            f"[Server] Received "
+                            f"Worker {worker_id} "
+                            f"update."
+                        )
+
+                        self.update_condition.notify_all()
+
+                # ------------------------------------------------
+                # FINISHED
+                # ------------------------------------------------
+
+                elif message_type == "FINISHED":
+
+                    print(
+                        f"[Server] Worker "
+                        f"{worker_id} reports "
+                        f"training finished."
+                    )
+
+                    with self.lock:
+
+                        self.active_workers.discard(
+                            worker_id
+                        )
+
+                else:
+
+                    print(
+                        f"[Server] Unknown message "
+                        f"from Worker {worker_id}: "
+                        f"{message_type}"
+                    )
+
+        except Exception as error:
+
+            print(
+                f"[Server] Worker "
+                f"{worker_id} connection ended: "
+                f"{error}"
+            )
+
+            with self.lock:
+
+                self.active_workers.discard(
+                    worker_id
+                )
+
+    # ========================================================
+    # WAIT FOR READY WORKERS
+    # ========================================================
+
+    def wait_for_workers_ready(
+        self,
+        timeout=600,
+    ):
 
         deadline = (
             time.time()
             + timeout
         )
 
-        while True:
+        with self.ready_condition:
 
-            with self.lock:
+            while (
+                len(self.worker_ready)
+                < self.num_workers
+            ):
 
-                ready = set(
-                    self.ready_workers
+                remaining = (
+                    deadline
+                    - time.time()
                 )
 
-            if len(ready) >= self.num_workers:
+                if remaining <= 0:
 
-                print()
-
-                print(
-                    "ALL REMOTE WORKERS ARE READY"
-                )
-
-                print(
-                    f"Ready workers: "
-                    f"{sorted(ready)}"
-                )
-
-                return
-
-            if time.time() >= deadline:
-
-                missing = (
-                    set(
-                        range(
-                            1,
-                            self.num_workers + 1,
-                        )
+                    raise TimeoutError(
+                        "Timed out waiting for "
+                        "workers to become READY."
                     )
-                    - ready
+
+                self.ready_condition.wait(
+                    timeout=min(
+                        remaining,
+                        1.0,
+                    )
                 )
 
-                raise TimeoutError(
-                    "Timed out waiting for "
-                    f"workers: "
-                    f"{sorted(missing)}"
+                print(
+                    f"\rReady workers: "
+                    f"{len(self.worker_ready)}/"
+                    f"{self.num_workers}",
+                    end="",
+                    flush=True,
                 )
-
-            print(
-                f"\rReady workers: "
-                f"{len(ready)}/"
-                f"{self.num_workers}",
-                end="",
-                flush=True,
-            )
-
-            time.sleep(
-                1
-            )
 
         print()
 
@@ -817,10 +753,10 @@ class SHAANCParameterServer:
     # WAIT FOR ROUND UPDATES
     # ========================================================
 
-    def wait_for_round_updates(
+    def wait_for_updates(
         self,
         epoch,
-        timeout=3600,
+        timeout=1800,
     ):
 
         deadline = (
@@ -828,125 +764,95 @@ class SHAANCParameterServer:
             + timeout
         )
 
-        required_workers = set(
-            range(
-                1,
-                self.num_workers + 1,
-            )
-        )
-
         while True:
 
-            with self.lock:
+            with self.update_condition:
 
-                received = {
-                    worker_id
-                    for worker_id, update
-                    in self.worker_updates.items()
-                    if int(
-                        update.get(
-                            "round",
-                            -1,
-                        )
-                    ) == epoch
-                }
+                required_workers = set(
+                    self.worker_ready
+                )
 
-            if received >= required_workers:
+                received_workers = set(
+                    self.updates.keys()
+                )
 
-                with self.lock:
+                if (
+                    received_workers
+                    >= required_workers
+                ):
 
-                    updates = [
-                        self.worker_updates[
+                    return [
+                        self.updates[
                             worker_id
                         ]
-                        for worker_id in sorted(
+                        for worker_id
+                        in sorted(
                             required_workers
                         )
                     ]
 
-                return updates
-
-            if time.time() >= deadline:
-
-                missing = (
-                    required_workers
-                    - received
+                remaining = (
+                    deadline
+                    - time.time()
                 )
 
-                raise TimeoutError(
-                    f"Timed out waiting for "
-                    f"round {epoch}. "
-                    f"Missing workers: "
-                    f"{sorted(missing)}"
+                if remaining <= 0:
+
+                    missing = (
+                        required_workers
+                        - received_workers
+                    )
+
+                    raise TimeoutError(
+                        f"Timed out waiting for "
+                        f"round {epoch} updates. "
+                        f"Missing workers: "
+                        f"{sorted(missing)}"
+                    )
+
+                self.update_condition.wait(
+                    timeout=min(
+                        remaining,
+                        1.0,
+                    )
                 )
-
-            print(
-                f"\rWaiting for workers: "
-                f"{len(received)}/"
-                f"{self.num_workers}",
-                end="",
-                flush=True,
-            )
-
-            time.sleep(
-                1
-            )
-
-        print()
 
     # ========================================================
-    # FEDERATED AVERAGING
+    # AGGREGATE MODELS
     # ========================================================
 
     def average_models(
         self,
-        updates,
+        participant_states,
     ):
 
-        if not updates:
+        if not participant_states:
 
             raise RuntimeError(
-                "No participant updates."
-            )
-
-        states = []
-
-        for update in updates:
-
-            if "weights" not in update:
-
-                continue
-
-            states.append(
-                update["weights"]
-            )
-
-        if not states:
-
-            raise RuntimeError(
-                "No model weights found."
+                "No participant models available."
             )
 
         averaged = {}
 
-        keys = states[0].keys()
+        keys = participant_states[0].keys()
 
         for key in keys:
 
-            tensors = [
-                state[key].float()
-                for state in states
-            ]
+            tensors = []
+
+            for state in participant_states:
+
+                tensors.append(
+                    state[key].float()
+                )
 
             stacked = torch.stack(
                 tensors,
                 dim=0,
             )
 
-            averaged[key] = (
-                stacked.mean(
-                    dim=0
-                )
+            averaged[key] = stacked.mean(
+                dim=0
             )
 
         self.model.load_state_dict(
@@ -957,52 +863,105 @@ class SHAANCParameterServer:
     # GLOBAL EARLY STOPPING
     # ========================================================
 
-    def check_global_early_stopping(
+    def check_global_convergence(
         self,
         validation_loss,
     ):
 
-        if (
-            validation_loss
-            <
-            self.best_global_validation_loss
-            - self.global_min_improvement
+        improvement = (
+            self.global_best_validation_loss
+            - validation_loss
+        )
+
+        if validation_loss < (
+            self.global_best_validation_loss
         ):
 
-            self.best_global_validation_loss = (
+            self.global_best_validation_loss = (
                 validation_loss
             )
 
+        if improvement >= GLOBAL_MIN_IMPROVEMENT:
+
             self.global_epochs_without_improvement = 0
 
-            return True
+        else:
 
-        self.global_epochs_without_improvement += 1
+            self.global_epochs_without_improvement += 1
 
-        return False
+        return (
+            self.global_epochs_without_improvement
+            >= self.global_patience
+        )
 
     # ========================================================
-    # CHECKPOINT
+    # PRINT UPDATE
+    # ========================================================
+
+    def print_worker_update(
+        self,
+        update,
+    ):
+
+        worker_id = update.get(
+            "worker_id",
+            "?",
+        )
+
+        loss = float(
+            update.get(
+                "loss",
+                0.0,
+            )
+        )
+
+        validation_loss = float(
+            update.get(
+                "validation_loss",
+                loss,
+            )
+        )
+
+        status = update.get(
+            "status",
+            "TRAINING",
+        )
+
+        elapsed = float(
+            update.get(
+                "training_time",
+                0.0,
+            )
+        )
+
+        print(
+            f"  Worker {worker_id}: "
+            f"train={loss:.6f} | "
+            f"validation={validation_loss:.6f} | "
+            f"time={elapsed:.2f}s | "
+            f"status={status}"
+        )
+
+    # ========================================================
+    # SAVE CHECKPOINT
     # ========================================================
 
     def save_checkpoint(
         self,
         epoch,
-        average_loss,
+        average_training_loss,
         average_validation_loss,
     ):
 
         torch.save(
             {
-
-                "epoch":
-                    epoch,
+                "epoch": epoch,
 
                 "model_state_dict":
                     self.model.state_dict(),
 
-                "average_participant_loss":
-                    average_loss,
+                "average_training_loss":
+                    average_training_loss,
 
                 "average_validation_loss":
                     average_validation_loss,
@@ -1024,213 +983,12 @@ class SHAANCParameterServer:
                 "host_convergence_epoch":
                     self.host_convergence_epoch,
 
-                "best_global_validation_loss":
-                    self.best_global_validation_loss,
+                "global_best_validation_loss":
+                    self.global_best_validation_loss,
 
             },
             GLOBAL_MODEL_PATH,
         )
-
-    # ========================================================
-    # PRINT UPDATES
-    # ========================================================
-
-    def print_participant_status(
-        self,
-        host_update,
-        worker_updates,
-    ):
-
-        print()
-
-        print(
-            "=" * 70
-        )
-
-        print(
-            "PARTICIPANT PERFORMANCE"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        all_updates = [
-            host_update
-        ] + list(
-            worker_updates
-        )
-
-        for update in all_updates:
-
-            participant = update.get(
-                "participant",
-                (
-                    "Worker "
-                    + str(
-                        update.get(
-                            "worker_id",
-                            "?",
-                        )
-                    )
-                ),
-            )
-
-            if (
-                update.get(
-                    "worker_id"
-                )
-                == 0
-            ):
-
-                participant = "HOST"
-
-            loss = float(
-                update.get(
-                    "loss",
-                    0.0,
-                )
-            )
-
-            validation_loss = float(
-                update.get(
-                    "validation_loss",
-                    loss,
-                )
-            )
-
-            status = update.get(
-                "status",
-                "TRAINING",
-            )
-
-            print(
-                f"{participant:<12} "
-                f"train={loss:.6f} | "
-                f"validation="
-                f"{validation_loss:.6f} | "
-                f"status={status}"
-            )
-
-        print(
-            "=" * 70
-        )
-
-    # ========================================================
-    # CREATE SERVER
-    # ========================================================
-
-    def create_server_socket(self):
-
-        self.server_socket = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM,
-        )
-
-        self.server_socket.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_REUSEADDR,
-            1,
-        )
-
-        self.server_socket.bind(
-            (
-                "0.0.0.0",
-                self.port,
-            )
-        )
-
-        self.server_socket.listen(
-            self.num_workers
-        )
-
-    # ========================================================
-    # ACCEPT WORKERS
-    # ========================================================
-
-    def accept_workers(self):
-
-        print()
-
-        print(
-            f"Waiting for "
-            f"{self.num_workers} workers..."
-        )
-
-        for worker_id in range(
-            1,
-            self.num_workers + 1,
-        ):
-
-            connection, address = (
-                self.server_socket.accept()
-            )
-
-            connection.settimeout(
-                1800
-            )
-
-            with self.lock:
-
-                self.workers[
-                    worker_id
-                ] = connection
-
-            print()
-
-            print(
-                f"Worker {worker_id} "
-                f"connected from "
-                f"{address}"
-            )
-
-            thread = threading.Thread(
-                target=self.handle_worker,
-                args=(
-                    worker_id,
-                    connection,
-                ),
-                daemon=True,
-            )
-
-            thread.start()
-
-    # ========================================================
-    # SHUTDOWN WORKERS
-    # ========================================================
-
-    def shutdown_workers(self):
-
-        print()
-
-        print(
-            "Sending shutdown signal..."
-        )
-
-        message = {
-            "type": "SHUTDOWN"
-        }
-
-        with self.lock:
-
-            workers_snapshot = dict(
-                self.workers
-            )
-
-        for worker_id, sock in (
-            workers_snapshot.items()
-        ):
-
-            try:
-
-                self.send_message(
-                    sock,
-                    message,
-                )
-
-            except Exception:
-
-                pass
 
     # ========================================================
     # START
@@ -1238,16 +996,19 @@ class SHAANCParameterServer:
 
     def start(self):
 
-        print()
+        # ----------------------------------------------------
+        # HOST DATASET
+        # ----------------------------------------------------
 
+        self.prepare_host_dataset()
+
+        print()
         print(
             "=" * 70
         )
-
         print(
             "S.H.A ANC FEDERATED PARAMETER SERVER"
         )
-
         print(
             "=" * 70
         )
@@ -1277,11 +1038,6 @@ class SHAANCParameterServer:
         )
 
         print(
-            f"Batch size       : "
-            f"{self.batch_size}"
-        )
-
-        print(
             f"Learning rate    : "
             f"{self.learning_rate}"
         )
@@ -1301,69 +1057,133 @@ class SHAANCParameterServer:
         )
 
         # ----------------------------------------------------
-        # Prepare host dataset BEFORE starting rounds
+        # SERVER SOCKET
         # ----------------------------------------------------
 
-        self.prepare_host_dataset()
+        self.server_socket = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+        )
+
+        self.server_socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1,
+        )
+
+        self.server_socket.bind(
+            (
+                "0.0.0.0",
+                self.port,
+            )
+        )
+
+        self.server_socket.listen(
+            self.num_workers
+        )
+
+        print()
+        print(
+            f"Waiting for "
+            f"{self.num_workers} workers..."
+        )
 
         # ----------------------------------------------------
-        # Server
+        # ACCEPT WORKERS
         # ----------------------------------------------------
 
-        self.create_server_socket()
+        for worker_id in range(
+            1,
+            self.num_workers + 1,
+        ):
+
+            connection, address = (
+                self.server_socket.accept()
+            )
+
+            connection.settimeout(
+                1800
+            )
+
+            self.workers[
+                worker_id
+            ] = connection
+
+            self.worker_connections[
+                worker_id
+            ] = connection
+
+            print(
+                f"Worker {worker_id} "
+                f"connected from "
+                f"{address}"
+            )
+
+            thread = threading.Thread(
+                target=self.handle_worker,
+                args=(
+                    worker_id,
+                    connection,
+                ),
+                daemon=True,
+            )
+
+            thread.start()
 
         # ----------------------------------------------------
-        # Workers
+        # READY HANDSHAKE
         # ----------------------------------------------------
 
-        self.accept_workers()
+        print()
+        print(
+            "=" * 70
+        )
+        print(
+            "WAITING FOR ALL WORKERS TO BE READY"
+        )
+        print(
+            "=" * 70
+        )
 
-        # ----------------------------------------------------
-        # READY SYNCHRONIZATION
-        # ----------------------------------------------------
+        print(
+            "Workers are preparing their local "
+            "LibriSpeech/MUSAN datasets."
+        )
 
         try:
 
-            self.wait_for_all_workers_ready()
+            self.wait_for_workers_ready()
 
         except TimeoutError as error:
 
             print()
-
             print(
                 f"[Server] {error}"
             )
 
-            self.shutdown_workers()
-
             return
 
         print()
-
         print(
             "=" * 70
         )
-
         print(
-            "ALL PARTICIPANTS READY"
+            "ALL REMOTE WORKERS READY"
         )
-
         print(
             "HOST IS ALSO A TRAINING PARTICIPANT"
         )
-
         print(
             f"TOTAL PARTICIPANTS = "
             f"{self.num_participants}"
         )
-
         print(
             "=" * 70
         )
 
-        # ----------------------------------------------------
-        # TRAINING
-        # ----------------------------------------------------
+        # ====================================================
+        # FEDERATED TRAINING
+        # ====================================================
 
         for epoch in range(
             1,
@@ -1371,212 +1191,298 @@ class SHAANCParameterServer:
         ):
 
             print()
-
             print(
                 "=" * 70
             )
-
             print(
                 f"FEDERATED ROUND "
                 f"{epoch}/{self.epochs}"
             )
-
             print(
                 "=" * 70
             )
 
             # ------------------------------------------------
-            # Reset worker updates
+            # RESET ROUND
             # ------------------------------------------------
 
             with self.lock:
 
-                self.worker_updates.clear()
+                self.updates.clear()
 
             # ------------------------------------------------
-            # Broadcast global model
+            # BROADCAST
             # ------------------------------------------------
 
-            self.broadcast_global_model(
+            print()
+            print(
+                "Broadcasting global model..."
+            )
+
+            self.broadcast_model(
                 epoch
             )
 
             # ------------------------------------------------
-            # HOST TRAINING
+            # START HOST TRAINING
+            #
+            # IMPORTANT:
+            #
+            # Host training is started in a separate thread.
+            #
+            # Therefore the server can simultaneously receive
+            # worker updates.
             # ------------------------------------------------
 
-            print()
+            host_result = {}
 
-            print(
-                "HOST LOCAL TRAINING"
-            )
+            def host_training():
 
-            if self.host_converged:
+                if self.host_converged:
 
+                    print()
+                    print(
+                        "[HOST] Already converged."
+                    )
+
+                    print(
+                        "[HOST] Skipping local "
+                        "training this round."
+                    )
+
+                    validation_loss = (
+                        self.validate_host()
+                    )
+
+                    host_result.update(
+                        {
+                            "loss":
+                                self.host_best_validation_loss,
+
+                            "validation_loss":
+                                validation_loss,
+
+                            "training_time":
+                                0.0,
+
+                            "batches":
+                                0,
+
+                            "status":
+                                "CONVERGED",
+
+                            "weights":
+                                self.model_state_dict(
+                                    self.model
+                                ),
+                        }
+                    )
+
+                    return
+
+                print()
                 print(
-                    "Host participant has converged."
+                    "[HOST] LOCAL TRAINING"
                 )
-
-                print(
-                    "Skipping host local training."
-                )
-
-                host_loss = (
-                    self.host_last_loss
-                )
-
-                host_validation_loss = (
-                    self.host_last_validation_loss
-                )
-
-                host_elapsed = 0.0
-
-                host_batches = 0
-
-            else:
 
                 (
-                    host_loss,
-                    host_elapsed,
-                    host_batches,
-                ) = (
-                    self.train_host_local_epoch()
-                )
+                    loss,
+                    elapsed,
+                    batches,
+                ) = self.train_host_epoch()
 
-                self.host_last_loss = (
-                    host_loss
-                )
-
-                print(
-                    f"Host training loss: "
-                    f"{host_loss:.6f}"
-                )
-
-                print(
-                    "HOST VALIDATION"
-                )
-
-                host_validation_loss = (
+                validation_loss = (
                     self.validate_host()
                 )
 
-                self.host_last_validation_loss = (
-                    host_validation_loss
+                converged = (
+                    self.check_host_convergence(
+                        validation_loss,
+                        epoch,
+                    )
                 )
+
+                status = (
+                    "CONVERGED"
+                    if converged
+                    else "TRAINING"
+                )
+
+                if converged:
+
+                    print()
+                    print(
+                        "[HOST] EARLY STOPPING"
+                    )
+
+                    print(
+                        f"[HOST] Validation "
+                        f"loss stopped improving "
+                        f"at round {epoch}."
+                    )
 
                 print(
-                    f"Host validation loss: "
-                    f"{host_validation_loss:.6f}"
+                    f"[HOST] train="
+                    f"{loss:.6f} | "
+                    f"validation="
+                    f"{validation_loss:.6f} | "
+                    f"time="
+                    f"{elapsed:.2f}s"
                 )
 
-                self.check_host_early_stopping(
-                    validation_loss=(
-                        host_validation_loss
-                    ),
-                    epoch=epoch,
+                host_result.update(
+                    {
+                        "loss":
+                            loss,
+
+                        "validation_loss":
+                            validation_loss,
+
+                        "training_time":
+                            elapsed,
+
+                        "batches":
+                            batches,
+
+                        "status":
+                            status,
+
+                        "weights":
+                            self.model_state_dict(
+                                self.model
+                            ),
+                    }
                 )
 
-            # ------------------------------------------------
-            # HOST UPDATE
-            # ------------------------------------------------
-
-            host_update = (
-                self.create_host_update(
-                    epoch=epoch,
-                    loss=host_loss,
-                    validation_loss=(
-                        host_validation_loss
-                    ),
-                    elapsed=host_elapsed,
-                    batches=host_batches,
-                )
+            host_thread = threading.Thread(
+                target=host_training,
+                daemon=True,
             )
+
+            host_thread.start()
 
             # ------------------------------------------------
             # WAIT FOR REMOTE WORKERS
             # ------------------------------------------------
 
             print()
-
             print(
-                "WAITING FOR REMOTE PARTICIPANTS"
+                "HOST, WORKER 1 AND WORKER 2 "
+                "ARE TRAINING..."
             )
 
             try:
 
                 worker_updates = (
-                    self.wait_for_round_updates(
-                        epoch=epoch
+                    self.wait_for_updates(
+                        epoch
                     )
                 )
 
             except TimeoutError as error:
 
                 print()
-
                 print(
                     f"[Server] {error}"
-                )
-
-                print(
-                    "Training stopped safely."
                 )
 
                 break
 
             # ------------------------------------------------
-            # Performance
+            # WAIT FOR HOST
             # ------------------------------------------------
 
-            self.print_participant_status(
-                host_update=host_update,
-                worker_updates=worker_updates,
+            host_thread.join()
+
+            # ------------------------------------------------
+            # VERIFY HOST
+            # ------------------------------------------------
+
+            if not host_result:
+
+                print(
+                    "[Server] Host training "
+                    "did not produce an update."
+                )
+
+                break
+
+            # ------------------------------------------------
+            # DISPLAY RESULTS
+            # ------------------------------------------------
+
+            print()
+            print(
+                "-" * 70
+            )
+            print(
+                "PARTICIPANT PERFORMANCE"
+            )
+            print(
+                "-" * 70
             )
 
+            print(
+                f"  HOST: "
+                f"train="
+                f"{host_result['loss']:.6f} | "
+                f"validation="
+                f"{host_result['validation_loss']:.6f} | "
+                f"status="
+                f"{host_result['status']}"
+            )
+
+            for update in worker_updates:
+
+                self.print_worker_update(
+                    update
+                )
+
             # ------------------------------------------------
-            # Combine all 3 participants
+            # BUILD 3-PARTICIPANT UPDATE
             # ------------------------------------------------
 
-            all_updates = [
-                host_update
-            ] + list(
+            participant_updates = [
+                host_result
+            ]
+
+            participant_updates.extend(
                 worker_updates
             )
 
-            print()
-
-            print(
-                "PARTICIPANTS CONTRIBUTING:"
-            )
-
-            print(
-                "  1. HOST"
-            )
-
-            print(
-                "  2. WORKER 1"
-            )
-
-            print(
-                "  3. WORKER 2"
-            )
-
-            print()
-
-            print(
-                "FEDERATED AVERAGING"
-            )
-
             # ------------------------------------------------
-            # Aggregate
+            # CHECK PARTICIPANT COUNT
             # ------------------------------------------------
 
-            self.average_models(
-                all_updates
-            )
+            valid_updates = [
+                update
+                for update
+                in participant_updates
+                if "weights"
+                in update
+            ]
+
+            if len(valid_updates) != (
+                self.num_participants
+            ):
+
+                print()
+                print(
+                    "[Server] WARNING:"
+                )
+
+                print(
+                    f"Expected "
+                    f"{self.num_participants} "
+                    f"participant models but "
+                    f"received "
+                    f"{len(valid_updates)}."
+                )
+
+                break
 
             # ------------------------------------------------
-            # Average metrics
+            # METRICS
             # ------------------------------------------------
 
             losses = [
@@ -1586,7 +1492,8 @@ class SHAANCParameterServer:
                         0.0,
                     )
                 )
-                for update in all_updates
+                for update
+                in valid_updates
             ]
 
             validation_losses = [
@@ -1599,7 +1506,8 @@ class SHAANCParameterServer:
                         ),
                     )
                 )
-                for update in all_updates
+                for update
+                in valid_updates
             ]
 
             average_loss = (
@@ -1613,132 +1521,121 @@ class SHAANCParameterServer:
             )
 
             print()
+            print(
+                "-" * 70
+            )
 
             print(
-                f"Average participant loss: "
+                f"Average participant "
+                f"training loss     = "
                 f"{average_loss:.6f}"
             )
 
             print(
-                f"Average participant validation "
-                f"loss: "
+                f"Average participant "
+                f"validation loss   = "
                 f"{average_validation_loss:.6f}"
             )
 
+            print(
+                "-" * 70
+            )
+
             # ------------------------------------------------
-            # Global early stopping
+            # FEDERATED AVERAGING
             # ------------------------------------------------
 
-            global_improved = (
-                self.check_global_early_stopping(
+            print()
+            print(
+                "FEDERATED AVERAGING"
+            )
+
+            print(
+                f"Aggregating "
+                f"{len(valid_updates)} "
+                f"participant models:"
+            )
+
+            print(
+                "  1. HOST"
+            )
+
+            for worker_id in sorted(
+                self.worker_ready
+            ):
+
+                print(
+                    f"  {worker_id + 1}. "
+                    f"WORKER {worker_id}"
+                )
+
+            participant_states = [
+                update["weights"]
+                for update
+                in valid_updates
+            ]
+
+            self.average_models(
+                participant_states
+            )
+
+            print(
+                "Global model updated."
+            )
+
+            # ------------------------------------------------
+            # GLOBAL EARLY STOPPING
+            # ------------------------------------------------
+
+            global_converged = (
+                self.check_global_convergence(
                     average_validation_loss
                 )
             )
 
-            if global_improved:
+            print()
+            print(
+                "GLOBAL EARLY STOPPING"
+            )
 
-                print()
+            print(
+                f"Best global validation "
+                f"loss: "
+                f"{self.global_best_validation_loss:.6f}"
+            )
 
-                print(
-                    "GLOBAL MODEL IMPROVED"
-                )
-
-                print(
-                    f"Best global validation loss: "
-                    f"{self.best_global_validation_loss:.6f}"
-                )
-
-            else:
-
-                print()
-
-                print(
-                    "Global model did not improve "
-                    "sufficiently."
-                )
-
-                print(
-                    f"Global patience: "
-                    f"{self.global_epochs_without_improvement}/"
-                    f"{self.global_patience}"
-                )
+            print(
+                f"Rounds without sufficient "
+                f"improvement: "
+                f"{self.global_epochs_without_improvement}/"
+                f"{self.global_patience}"
+            )
 
             # ------------------------------------------------
-            # Save checkpoint
+            # CHECKPOINT
             # ------------------------------------------------
 
             self.save_checkpoint(
                 epoch=epoch,
-                average_loss=average_loss,
+                average_training_loss=average_loss,
                 average_validation_loss=(
                     average_validation_loss
                 ),
             )
 
             print()
-
             print(
-                f"Global model checkpoint saved:"
-            )
-
-            print(
-                f"  {GLOBAL_MODEL_PATH}"
+                f"Global checkpoint saved:"
+                f"\n{GLOBAL_MODEL_PATH}"
             )
 
             # ------------------------------------------------
-            # Participant convergence
+            # GLOBAL STOP
             # ------------------------------------------------
 
-            converged_workers = [
-                update.get(
-                    "worker_id"
-                )
-                for update
-                in worker_updates
-                if update.get(
-                    "status"
-                ) == "CONVERGED"
-            ]
-
-            if converged_workers:
-
-                with self.lock:
-
-                    self.stopped_workers.update(
-                        converged_workers
-                    )
+            if global_converged:
 
                 print()
-
-                print(
-                    "Participants currently "
-                    "converged:"
-                )
-
-                print(
-                    f"  Workers: "
-                    f"{sorted(converged_workers)}"
-                )
-
-            if self.host_converged:
-
-                print()
-
-                print(
-                    "HOST PARTICIPANT: CONVERGED"
-                )
-
-            # ------------------------------------------------
-            # Global stop
-            # ------------------------------------------------
-
-            if (
-                self.global_epochs_without_improvement
-                >= self.global_patience
-            ):
-
-                print()
-
                 print(
                     "=" * 70
                 )
@@ -1749,32 +1646,53 @@ class SHAANCParameterServer:
 
                 print(
                     f"No sufficient global "
-                    f"validation improvement for "
-                    f"{self.global_patience} rounds."
+                    f"improvement for "
+                    f"{self.global_patience} "
+                    f"rounds."
                 )
 
                 print(
                     "=" * 70
                 )
 
-                self.training_complete = True
-
                 break
 
-        # ----------------------------------------------------
+            # ------------------------------------------------
+            # PARTICIPANT STATUS
+            # ------------------------------------------------
+
+            with self.lock:
+
+                stopped_count = len(
+                    self.stopped_workers
+                )
+
+            print()
+            print(
+                f"Remote workers converged: "
+                f"{stopped_count}/"
+                f"{self.num_workers}"
+            )
+
+            print(
+                f"Host converged: "
+                f"{self.host_converged}"
+            )
+
+        # ====================================================
         # COMPLETE
-        # ----------------------------------------------------
+        # ====================================================
+
+        self.training_complete = True
 
         print()
-
         print(
             "=" * 70
         )
-
         print(
-            "S.H.A ANC FEDERATED TRAINING COMPLETE"
+            "S.H.A ANC DISTRIBUTED "
+            "TRAINING COMPLETE"
         )
-
         print(
             "=" * 70
         )
@@ -1787,11 +1705,14 @@ class SHAANCParameterServer:
             f"{GLOBAL_MODEL_PATH}"
         )
 
-        print()
-
         print(
             f"Best global validation loss: "
-            f"{self.best_global_validation_loss:.6f}"
+            f"{self.global_best_validation_loss:.6f}"
+        )
+
+        print(
+            f"Remote workers converged: "
+            f"{sorted(self.stopped_workers)}"
         )
 
         print(
@@ -1800,70 +1721,44 @@ class SHAANCParameterServer:
         )
 
         print(
-            f"Host convergence round: "
-            f"{self.host_convergence_epoch}"
-        )
-
-        print(
-            f"Workers currently converged: "
-            f"{sorted(self.stopped_workers)}"
-        )
-
-        print()
-
-        print(
-            "Federated participants:"
-        )
-
-        print(
-            "  HOST"
-        )
-
-        print(
-            "  WORKER 1"
-        )
-
-        print(
-            "  WORKER 2"
-        )
-
-        print(
             "=" * 70
         )
 
         # ----------------------------------------------------
-        # Shutdown
+        # CLOSE WORKERS
         # ----------------------------------------------------
 
-        self.shutdown_workers()
-
-        time.sleep(
-            1
-        )
-
-        with self.lock:
-
-            workers_snapshot = dict(
-                self.workers
-            )
-
-        for sock in (
-            workers_snapshot.values()
-        ):
+        for sock in self.workers.values():
 
             try:
+
+                self.send_message(
+                    sock,
+                    {
+                        "type":
+                            "TRAINING_COMPLETE"
+                    },
+                )
+
+            except Exception:
+
+                pass
+
+            try:
+
                 sock.close()
 
             except Exception:
+
                 pass
 
-        if self.server_socket is not None:
+        try:
 
-            try:
-                self.server_socket.close()
+            self.server_socket.close()
 
-            except Exception:
-                pass
+        except Exception:
+
+            pass
 
 
 # ============================================================
@@ -1874,8 +1769,9 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "S.H.A ANC synchronized federated "
-            "parameter server"
+            "S.H.A ANC federated parameter "
+            "server with host training, "
+            "READY handshake and early stopping."
         )
     )
 
@@ -1912,56 +1808,18 @@ def main():
     parser.add_argument(
         "--patience",
         type=int,
-        default=PATIENCE,
-    )
-
-    parser.add_argument(
-        "--min-improvement",
-        type=float,
-        default=MIN_IMPROVEMENT,
-    )
-
-    parser.add_argument(
-        "--global-patience",
-        type=int,
         default=GLOBAL_PATIENCE,
-    )
-
-    parser.add_argument(
-        "--global-min-improvement",
-        type=float,
-        default=GLOBAL_MIN_IMPROVEMENT,
     )
 
     args = parser.parse_args()
 
     server = SHAANCParameterServer(
-
         port=args.port,
-
         num_workers=args.num_workers,
-
         epochs=args.epochs,
-
         batch_size=args.batch_size,
-
         learning_rate=args.lr,
-
-        participant_patience=(
-            args.patience
-        ),
-
-        participant_min_improvement=(
-            args.min_improvement
-        ),
-
-        global_patience=(
-            args.global_patience
-        ),
-
-        global_min_improvement=(
-            args.global_min_improvement
-        ),
+        global_patience=args.patience,
     )
 
     server.start()
