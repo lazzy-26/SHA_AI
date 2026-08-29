@@ -22,6 +22,42 @@ from model import create_model
 
 
 # ============================================================
+# TCP KEEPALIVE HELPERS
+# ============================================================
+
+def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
+    """
+    Enable TCP keepalive on a socket to prevent NAT/routers from
+    silently dropping idle connections.
+    
+    Args:
+        sock: The socket to configure
+        idle_seconds: Seconds of idleness before sending first probe
+        interval_seconds: Seconds between subsequent probes
+        max_probes: Number of unacknowledged probes before declaring dead
+    """
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    
+    # Linux-specific keepalive tuning (works on most systems)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_seconds)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval_seconds)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, max_probes)
+    except (AttributeError, OSError):
+        pass  # Not all systems support these options
+    
+    # Windows-specific keepalive tuning
+    try:
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            sock.ioctl(
+                socket.SIO_KEEPALIVE_VALS,
+                (1, idle_seconds * 1000, interval_seconds * 1000),
+            )
+    except (AttributeError, OSError):
+        pass
+
+
+# ============================================================
 # S.H.A ANC FEDERATED WORKER
 #
 # Every worker owns its own local:
@@ -66,6 +102,7 @@ class SHAANCWorker:
         learning_rate,
         min_improvement=MIN_IMPROVEMENT,
         patience=PATIENCE,
+        max_samples=None,  # NEW: limit dataset size for fast testing
     ):
 
         # ----------------------------------------------------
@@ -94,6 +131,8 @@ class SHAANCWorker:
             int(patience),
             1,
         )
+
+        self.max_samples = max_samples  # NEW
 
         # ----------------------------------------------------
         # Model
@@ -277,12 +316,25 @@ class SHAANCWorker:
                     )
                 )
 
+                # ==== ENABLE TCP KEEPALIVE RIGHT AFTER CONNECT ====
+                enable_keepalive(
+                    self.socket,
+                    idle_seconds=20,
+                    interval_seconds=10,
+                    max_probes=5,
+                )
+                # ==================================================
+
                 print()
                 print(
                     f"[Worker {self.worker_id}] "
                     f"Connected to "
                     f"{self.server_ip}:"
                     f"{self.port}"
+                )
+                print(
+                    f"[Worker {self.worker_id}] "
+                    "TCP keepalive enabled (idle=20s, interval=10s)"
                 )
 
                 return
@@ -342,6 +394,13 @@ class SHAANCWorker:
             "Using local LibriSpeech/MUSAN dataset."
         )
 
+        if self.max_samples is not None:
+            print(
+                f"[Worker {self.worker_id}] "
+                f"LIMITING to {self.max_samples} samples "
+                "(for fast testing)"
+            )
+
         (
             self.train_loader,
             self.validation_loader,
@@ -350,6 +409,7 @@ class SHAANCWorker:
                 f"WORKER_{self.worker_id}"
             ),
             batch_size=self.batch_size,
+            max_samples=self.max_samples,  # NEW: pass through
         )
 
         print()
@@ -847,6 +907,12 @@ class SHAANCWorker:
             f"{self.patience}"
         )
 
+        if self.max_samples is not None:
+            print(
+                f"Max samples     : "
+                f"{self.max_samples} (TESTING MODE)"
+            )
+
         print(
             "=" * 70
         )
@@ -1202,6 +1268,13 @@ def main():
         default=PATIENCE,
     )
 
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Limit dataset to N samples per participant (for fast testing).",
+    )
+
     args = parser.parse_args()
 
     worker = SHAANCWorker(
@@ -1225,6 +1298,8 @@ def main():
         ),
 
         patience=args.patience,
+
+        max_samples=args.max_samples,  # NEW
     )
 
     worker.train()

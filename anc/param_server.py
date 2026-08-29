@@ -26,6 +26,42 @@ from model import create_model
 
 
 # ============================================================
+# TCP KEEPALIVE HELPERS
+# ============================================================
+
+def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
+    """
+    Enable TCP keepalive on a socket to prevent NAT/routers from
+    silently dropping idle connections.
+    
+    Args:
+        sock: The socket to configure
+        idle_seconds: Seconds of idleness before sending first probe
+        interval_seconds: Seconds between subsequent probes
+        max_probes: Number of unacknowledged probes before declaring dead
+    """
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    
+    # Linux-specific keepalive tuning (works on most systems)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_seconds)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval_seconds)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, max_probes)
+    except (AttributeError, OSError):
+        pass  # Not all systems support these options
+    
+    # Windows-specific keepalive tuning
+    try:
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            sock.ioctl(
+                socket.SIO_KEEPALIVE_VALS,
+                (1, idle_seconds * 1000, interval_seconds * 1000),
+            )
+    except (AttributeError, OSError):
+        pass
+
+
+# ============================================================
 # S.H.A ANC FEDERATED PARAMETER SERVER
 #
 # Architecture
@@ -64,6 +100,8 @@ class SHAANCParameterServer:
         learning_rate=LEARNING_RATE,
         participant_patience=MIN_IMPROVEMENT,
         global_patience=GLOBAL_PATIENCE,
+        ready_timeout=1800,
+        max_samples=None,  # NEW: limit dataset size for fast testing
     ):
 
         # ----------------------------------------------------
@@ -104,6 +142,18 @@ class SHAANCParameterServer:
             int(global_patience),
             1,
         )
+
+        # How long the host waits, at start(), for every
+        # remote worker to connect AND send READY before
+        # giving up. Increased from a 600s default -- real
+        # LibriSpeech/MUSAN datasets can take a while to
+        # discover/index on slower machines.
+        self.ready_timeout = max(
+            int(ready_timeout),
+            1,
+        )
+
+        self.max_samples = max_samples  # NEW
 
         # ----------------------------------------------------
         # Global model
@@ -312,12 +362,19 @@ class SHAANCParameterServer:
             "=" * 70
         )
 
+        if self.max_samples is not None:
+            print(
+                f"[HOST] LIMITING to {self.max_samples} samples "
+                "(for fast testing)"
+            )
+
         (
             self.host_train_loader,
             self.host_validation_loader,
         ) = get_local_loaders(
             participant_id="HOST",
             batch_size=self.batch_size,
+            max_samples=self.max_samples,  # NEW: pass through
         )
 
         print()
@@ -705,8 +762,12 @@ class SHAANCParameterServer:
 
     def wait_for_workers_ready(
         self,
-        timeout=600,
+        timeout=None,
     ):
+
+        if timeout is None:
+
+            timeout = self.ready_timeout
 
         deadline = (
             time.time()
@@ -1053,6 +1114,17 @@ class SHAANCParameterServer:
         )
 
         print(
+            f"Ready timeout    : "
+            f"{self.ready_timeout}s"
+        )
+
+        if self.max_samples is not None:
+            print(
+                f"Max samples      : "
+                f"{self.max_samples} (TESTING MODE)"
+            )
+
+        print(
             "=" * 70
         )
 
@@ -1101,6 +1173,15 @@ class SHAANCParameterServer:
                 self.server_socket.accept()
             )
 
+            # ==== ENABLE TCP KEEPALIVE RIGHT AFTER ACCEPT ====
+            enable_keepalive(
+                connection,
+                idle_seconds=20,
+                interval_seconds=10,
+                max_probes=5,
+            )
+            # ==================================================
+
             connection.settimeout(
                 1800
             )
@@ -1117,6 +1198,11 @@ class SHAANCParameterServer:
                 f"Worker {worker_id} "
                 f"connected from "
                 f"{address}"
+            )
+            print(
+                f"[Server] TCP keepalive enabled "
+                f"for Worker {worker_id} "
+                f"(idle=20s, interval=10s)"
             )
 
             thread = threading.Thread(
@@ -1811,6 +1897,25 @@ def main():
         default=GLOBAL_PATIENCE,
     )
 
+    parser.add_argument(
+        "--ready-timeout",
+        type=int,
+        default=1800,
+        help=(
+            "Seconds to wait for all remote "
+            "workers to connect and become "
+            "READY before giving up. "
+            "Default: 1800 (30 minutes)."
+        ),
+    )
+
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Limit dataset to N samples per participant (for fast testing).",
+    )
+
     args = parser.parse_args()
 
     server = SHAANCParameterServer(
@@ -1820,6 +1925,8 @@ def main():
         batch_size=args.batch_size,
         learning_rate=args.lr,
         global_patience=args.patience,
+        ready_timeout=args.ready_timeout,
+        max_samples=args.max_samples,  # NEW
     )
 
     server.start()
