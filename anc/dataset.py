@@ -4,14 +4,22 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
+
 from scipy.signal import resample_poly
-from torch.utils.data import DataLoader, Dataset
+
+from torch.utils.data import (
+    DataLoader,
+    Dataset,
+)
 
 from config import (
-    CLEAN_DIR,
-    NOISE_DIR,
+    BATCH_SIZE,
+    DATASET_MULTIPLIER,
+    LIBRISPEECH_DIR,
+    MUSAN_DIR,
     SAMPLE_RATE,
     SEGMENT_SAMPLES,
+    SEED,
     SNR_MAX_DB,
     SNR_MIN_DB,
 )
@@ -21,17 +29,30 @@ from config import (
 # AUDIO FILE DISCOVERY
 # ============================================================
 
-def find_audio_files(folder: Path):
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".wav",
+    ".flac",
+}
+
+
+def find_audio_files(folder):
     """
-    Find all supported audio files inside a directory.
+    Recursively discover supported audio files.
     """
+
+    folder = Path(folder)
+
+    if not folder.exists():
+        return []
+
     return sorted(
         path
         for path in folder.rglob("*")
-        if path.suffix.lower() in {
-            ".wav",
-            ".flac",
-        }
+        if (
+            path.is_file()
+            and path.suffix.lower()
+            in SUPPORTED_AUDIO_EXTENSIONS
+        )
     )
 
 
@@ -41,76 +62,126 @@ def find_audio_files(folder: Path):
 
 def load_audio(path):
     """
-    Load an audio file, convert it to mono and resample it
-    to the sample rate used by the S.H.A ANC model.
+    Load an audio file and convert it to:
+
+        float32
+        mono
+        SAMPLE_RATE
     """
+
+    path = Path(path)
 
     audio, sample_rate = sf.read(
         path,
         always_2d=False,
     )
 
-    # Convert stereo/multi-channel audio to mono.
+    # --------------------------------------------------------
+    # Convert stereo/multi-channel to mono
+    # --------------------------------------------------------
+
     if audio.ndim == 2:
+
         audio = np.mean(
             audio,
             axis=1,
         )
 
-    audio = audio.astype(
-        np.float32
+    audio = np.asarray(
+        audio,
+        dtype=np.float32,
     )
 
-    # Resample when necessary.
+    # --------------------------------------------------------
+    # Remove invalid values
+    # --------------------------------------------------------
+
+    audio = np.nan_to_num(
+        audio,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    # --------------------------------------------------------
+    # Resample
+    # --------------------------------------------------------
+
     if sample_rate != SAMPLE_RATE:
+
         audio = resample_poly(
             audio,
             SAMPLE_RATE,
             sample_rate,
-        ).astype(np.float32)
+        )
 
-    # Prevent samples from exceeding the valid range.
-    peak = np.max(
-        np.abs(audio)
+        audio = audio.astype(
+            np.float32
+        )
+
+    # --------------------------------------------------------
+    # Prevent excessive amplitude
+    # --------------------------------------------------------
+
+    if len(audio) > 0:
+
+        peak = float(
+            np.max(
+                np.abs(audio)
+            )
+        )
+
+        if peak > 1.0:
+
+            audio = (
+                audio
+                / peak
+            )
+
+    return audio.astype(
+        np.float32
     )
-
-    if peak > 1.0:
-        audio /= peak
-
-    return audio
 
 
 # ============================================================
-# RANDOM AUDIO SEGMENT
+# RANDOM SEGMENT
 # ============================================================
 
 def random_segment(audio):
     """
-    Return one fixed-length training segment.
-
-    Long files:
-        Select a random segment.
-
-    Short files:
-        Zero-pad them to SEGMENT_SAMPLES.
+    Return exactly SEGMENT_SAMPLES samples.
     """
 
+    if len(audio) == 0:
+
+        return np.zeros(
+            SEGMENT_SAMPLES,
+            dtype=np.float32,
+        )
+
     if len(audio) >= SEGMENT_SAMPLES:
+
         start = random.randint(
             0,
-            len(audio) - SEGMENT_SAMPLES,
+            len(audio)
+            - SEGMENT_SAMPLES,
         )
 
         return audio[
-            start:start + SEGMENT_SAMPLES
-        ]
+            start:
+            start + SEGMENT_SAMPLES
+        ].astype(
+            np.float32
+        )
 
     padded = np.zeros(
         SEGMENT_SAMPLES,
         dtype=np.float32,
     )
 
-    padded[:len(audio)] = audio
+    padded[
+        :len(audio)
+    ] = audio
 
     return padded
 
@@ -120,20 +191,24 @@ def random_segment(audio):
 # ============================================================
 
 def prepare_noise(noise):
-    """
-    Prepare a noise recording to have exactly the same number
-    of samples as the clean speech segment.
-    """
+
+    if len(noise) == 0:
+
+        return np.zeros(
+            SEGMENT_SAMPLES,
+            dtype=np.float32,
+        )
 
     if len(noise) >= SEGMENT_SAMPLES:
-        return random_segment(noise)
 
-    # Repeat short noise recordings instead of padding them
-    # mostly with silence.
+        return random_segment(
+            noise
+        )
+
     repeats = int(
         np.ceil(
             SEGMENT_SAMPLES
-            / max(len(noise), 1)
+            / len(noise)
         )
     )
 
@@ -148,7 +223,7 @@ def prepare_noise(noise):
 
 
 # ============================================================
-# CLEAN + NOISE MIXING
+# MIX CLEAN + NOISE
 # ============================================================
 
 def mix_at_snr(
@@ -156,24 +231,38 @@ def mix_at_snr(
     noise,
     snr_db,
 ):
-    """
-    Mix clean speech and noise at a randomly selected
-    signal-to-noise ratio.
-    """
+
+    clean = clean.astype(
+        np.float32
+    )
+
+    noise = noise.astype(
+        np.float32
+    )
 
     clean_power = (
-        np.mean(clean ** 2)
+        np.mean(
+            clean ** 2
+        )
         + 1e-8
     )
 
     noise_power = (
-        np.mean(noise ** 2)
+        np.mean(
+            noise ** 2
+        )
         + 1e-8
     )
 
     target_noise_power = (
         clean_power
-        / (10 ** (snr_db / 10.0))
+        / (
+            10.0
+            ** (
+                snr_db
+                / 10.0
+            )
+        )
     )
 
     noise_scale = np.sqrt(
@@ -182,7 +271,8 @@ def mix_at_snr(
     )
 
     scaled_noise = (
-        noise * noise_scale
+        noise
+        * noise_scale
     )
 
     noisy = (
@@ -190,13 +280,14 @@ def mix_at_snr(
         + scaled_noise
     )
 
-    # Avoid clipping while preserving the relationship
-    # between the noisy signal and clean target.
-    peak = np.max(
-        np.abs(noisy)
+    peak = float(
+        np.max(
+            np.abs(noisy)
+        )
     )
 
     if peak > 0.99:
+
         scale = (
             0.99
             / peak
@@ -206,30 +297,29 @@ def mix_at_snr(
         clean *= scale
 
     return (
-        noisy.astype(np.float32),
-        clean.astype(np.float32),
+        noisy.astype(
+            np.float32
+        ),
+        clean.astype(
+            np.float32
+        ),
     )
 
 
 # ============================================================
-# S.H.A ANC DATASET
+# DATASET
 # ============================================================
 
 class SHAAudioDataset(Dataset):
-    """
-    Dataset used by each S.H.A distributed training worker.
-
-    Every clean speech recording can produce several different
-    training examples because noise and SNR are selected
-    randomly each time.
-    """
 
     def __init__(
         self,
         clean_files,
         noise_files,
-        multiplier=8,
+        multiplier=DATASET_MULTIPLIER,
+        validation=False,
     ):
+
         self.clean_files = list(
             clean_files
         )
@@ -238,19 +328,29 @@ class SHAAudioDataset(Dataset):
             noise_files
         )
 
-        self.multiplier = multiplier
+        self.multiplier = max(
+            int(multiplier),
+            1,
+        )
+
+        self.validation = (
+            validation
+        )
 
         if not self.clean_files:
+
             raise RuntimeError(
                 "No clean speech files found."
             )
 
         if not self.noise_files:
+
             raise RuntimeError(
                 "No noise files found."
             )
 
     def __len__(self):
+
         return (
             len(self.clean_files)
             * self.multiplier
@@ -260,37 +360,102 @@ class SHAAudioDataset(Dataset):
         self,
         index,
     ):
-        # Cycle through the worker's local clean speech files.
-        clean_path = self.clean_files[
-            index % len(self.clean_files)
-        ]
 
-        # Randomly choose a noise recording.
-        noise_path = random.choice(
-            self.noise_files
+        clean_path = (
+            self.clean_files[
+                index
+                % len(
+                    self.clean_files
+                )
+            ]
         )
 
-        clean = load_audio(
-            clean_path
-        )
+        # ----------------------------------------------------
+        # Deterministic validation
+        # ----------------------------------------------------
 
-        noise = load_audio(
-            noise_path
-        )
+        if self.validation:
 
-        clean = random_segment(
-            clean
-        )
+            noise_index = (
+                index
+                % len(
+                    self.noise_files
+                )
+            )
 
-        noise = prepare_noise(
-            noise
-        )
+            noise_path = (
+                self.noise_files[
+                    noise_index
+                ]
+            )
 
-        # Generate a random SNR for this training example.
-        snr_db = random.uniform(
-            SNR_MIN_DB,
-            SNR_MAX_DB,
-        )
+            clean = load_audio(
+                clean_path
+            )
+
+            noise = load_audio(
+                noise_path
+            )
+
+            # Deterministic segment.
+            if len(clean) >= SEGMENT_SAMPLES:
+
+                max_start = (
+                    len(clean)
+                    - SEGMENT_SAMPLES
+                )
+
+                start = (
+                    index
+                    % (
+                        max_start + 1
+                    )
+                )
+
+                clean = clean[
+                    start:
+                    start + SEGMENT_SAMPLES
+                ]
+
+            else:
+
+                clean = random_segment(
+                    clean
+                )
+
+            noise = prepare_noise(
+                noise
+            )
+
+            # Fixed validation SNR.
+            snr_db = 5.0
+
+        else:
+
+            noise_path = random.choice(
+                self.noise_files
+            )
+
+            clean = load_audio(
+                clean_path
+            )
+
+            noise = load_audio(
+                noise_path
+            )
+
+            clean = random_segment(
+                clean
+            )
+
+            noise = prepare_noise(
+                noise
+            )
+
+            snr_db = random.uniform(
+                SNR_MIN_DB,
+                SNR_MAX_DB,
+            )
 
         noisy, clean = mix_at_snr(
             clean,
@@ -299,12 +464,16 @@ class SHAAudioDataset(Dataset):
         )
 
         noisy_tensor = (
-            torch.from_numpy(noisy)
+            torch.from_numpy(
+                noisy
+            )
             .unsqueeze(0)
         )
 
         clean_tensor = (
-            torch.from_numpy(clean)
+            torch.from_numpy(
+                clean
+            )
             .unsqueeze(0)
         )
 
@@ -315,100 +484,219 @@ class SHAAudioDataset(Dataset):
 
 
 # ============================================================
-# WORKER DATA LOADER
+# SPLIT LOCAL DATASET
 # ============================================================
 
-def get_worker_loader(
-    worker_id,
-    num_workers,
-    batch_size,
+def split_files(
+    files,
+    validation_ratio=0.2,
 ):
     """
-    Load the physical dataset stored on this worker.
+    Split the LOCAL clean dataset.
 
-    IMPORTANT:
+    Every PC performs this independently.
 
-    The dataset has already been physically divided into
-    three worker shards.
-
-    Therefore we DO NOT perform:
-
-        clean_files[worker_id - 1::num_workers]
-
-    anymore.
-
-    Each worker uses 100% of the clean files that exist in
-    its own local datasets/anc/clean directory.
+    80% -> training
+    20% -> validation
     """
 
+    files = list(files)
+
+    if len(files) < 2:
+
+        return files, files
+
+    rng = random.Random(
+        SEED
+    )
+
+    shuffled = list(files)
+
+    rng.shuffle(
+        shuffled
+    )
+
+    validation_count = max(
+        1,
+        int(
+            len(shuffled)
+            * validation_ratio
+        ),
+    )
+
+    validation_files = (
+        shuffled[
+            :validation_count
+        ]
+    )
+
+    training_files = (
+        shuffled[
+            validation_count:
+        ]
+    )
+
+    if not training_files:
+
+        training_files = (
+            validation_files
+        )
+
+    return (
+        training_files,
+        validation_files,
+    )
+
+
+# ============================================================
+# LOCAL DATALOADERS
+# ============================================================
+
+def get_local_loaders(
+    participant_id="HOST",
+    batch_size=BATCH_SIZE,
+):
+    """
+    Build training and validation loaders from:
+
+        sources/librispeech
+        sources/musan
+
+    on the CURRENT machine.
+    """
+
+    clean_dir = Path(
+        LIBRISPEECH_DIR
+    )
+
+    noise_dir = Path(
+        MUSAN_DIR
+    )
+
+    if not clean_dir.exists():
+
+        raise RuntimeError(
+            f"[{participant_id}] "
+            f"LibriSpeech directory does not exist:\n"
+            f"{clean_dir}"
+        )
+
+    if not noise_dir.exists():
+
+        raise RuntimeError(
+            f"[{participant_id}] "
+            f"MUSAN directory does not exist:\n"
+            f"{noise_dir}"
+        )
+
     clean_files = find_audio_files(
-        CLEAN_DIR
+        clean_dir
     )
 
     noise_files = find_audio_files(
-        NOISE_DIR
+        noise_dir
     )
 
     if not clean_files:
+
         raise RuntimeError(
-            f"No clean files found in "
-            f"{CLEAN_DIR}"
+            f"[{participant_id}] "
+            "No LibriSpeech audio files found."
         )
 
     if not noise_files:
+
         raise RuntimeError(
-            f"No noise files found in "
-            f"{NOISE_DIR}"
+            f"[{participant_id}] "
+            "No MUSAN audio files found."
         )
 
-    print()
-    print(
-        f"[Worker {worker_id}] "
-        f"Dataset information"
-    )
-
-    print(
-        f"[Worker {worker_id}] "
-        f"Clean files : "
-        f"{len(clean_files)}"
-    )
-
-    print(
-        f"[Worker {worker_id}] "
-        f"Noise files : "
-        f"{len(noise_files)}"
-    )
-
-    print(
-        f"[Worker {worker_id}] "
-        f"Multiplier  : 8"
-    )
-
-    training_samples = (
-        len(clean_files)
-        * 8
-    )
-
-    print(
-        f"[Worker {worker_id}] "
-        f"Training examples per epoch: "
-        f"{training_samples}"
+    (
+        training_files,
+        validation_files,
+    ) = split_files(
+        clean_files
     )
 
     print()
+    print(
+        "-" * 70
+    )
 
-    dataset = SHAAudioDataset(
-        clean_files=clean_files,
+    print(
+        f"[{participant_id}] LOCAL DATASET"
+    )
+
+    print(
+        "-" * 70
+    )
+
+    print(
+        f"LibriSpeech : {clean_dir}"
+    )
+
+    print(
+        f"MUSAN       : {noise_dir}"
+    )
+
+    print(
+        f"Clean files : {len(clean_files)}"
+    )
+
+    print(
+        f"Noise files : {len(noise_files)}"
+    )
+
+    print(
+        f"Training    : {len(training_files)}"
+    )
+
+    print(
+        f"Validation  : {len(validation_files)}"
+    )
+
+    print(
+        f"Multiplier  : {DATASET_MULTIPLIER}"
+    )
+
+    print(
+        "-" * 70
+    )
+
+    train_dataset = SHAAudioDataset(
+        clean_files=training_files,
         noise_files=noise_files,
-        multiplier=8,
+        multiplier=DATASET_MULTIPLIER,
+        validation=False,
     )
 
-    loader = DataLoader(
-        dataset,
+    validation_dataset = SHAAudioDataset(
+        clean_files=validation_files,
+        noise_files=noise_files,
+        multiplier=max(
+            2,
+            DATASET_MULTIPLIER // 2,
+        ),
+        validation=True,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=0,
         drop_last=False,
     )
 
-    return loader
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+    )
+
+    return (
+        train_loader,
+        validation_loader,
+    )
