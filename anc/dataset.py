@@ -16,562 +16,211 @@ from torch.utils.data import (
 from config import (
     BATCH_SIZE,
     DATALOADER_WORKERS,
-    DATASET_MULTIPLIER,
-    LIBRISPEECH_DIR,
-    MUSAN_DIR,
     SAMPLE_RATE,
     SEGMENT_SAMPLES,
-    SNR_MAX_DB,
-    SNR_MIN_DB,
+    TRAIN_CLEAN_DIR,
+    TRAIN_NOISY_DIR,
     VALIDATION_RATIO,
 )
 
 
-SUPPORTED_AUDIO_EXTENSIONS = {
-    ".wav",
-    ".flac",
-}
+SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".flac"}
 
 
-def find_audio_files(
-    folder: Path,
-):
+def find_audio_files(folder):
     folder = Path(folder)
-
     if not folder.exists():
         return []
-
     return sorted(
         path
         for path in folder.rglob("*")
-        if (
-            path.is_file()
-            and path.suffix.lower()
-            in SUPPORTED_AUDIO_EXTENSIONS
-        )
+        if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
     )
 
 
 @lru_cache(maxsize=512)
-def load_audio_cached(
-    path_string,
-):
+def load_audio_cached(path_string):
     path = Path(path_string)
-
-    audio, sample_rate = sf.read(
-        path,
-        always_2d=False,
-    )
+    audio, sample_rate = sf.read(path, always_2d=False)
 
     if audio.ndim == 2:
-        audio = np.mean(
-            audio,
-            axis=1,
-        )
+        audio = np.mean(audio, axis=1)
 
-    audio = np.asarray(
-        audio,
-        dtype=np.float32,
-    )
-
-    audio = np.nan_to_num(
-        audio,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
+    audio = np.asarray(audio, dtype=np.float32)
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
 
     if sample_rate != SAMPLE_RATE:
-        audio = resample_poly(
-            audio,
-            SAMPLE_RATE,
-            sample_rate,
-        ).astype(
-            np.float32
-        )
+        audio = resample_poly(audio, SAMPLE_RATE, sample_rate).astype(np.float32)
 
     if len(audio) > 0:
-        peak = float(
-            np.max(
-                np.abs(audio)
-            )
-        )
-
+        peak = float(np.max(np.abs(audio)))
         if peak > 1.0:
-            audio = (
-                audio / peak
-            )
+            audio = audio / peak
 
-    return audio.astype(
-        np.float32
-    )
+    return audio.astype(np.float32)
 
 
 def load_audio(path):
-    return load_audio_cached(
-        str(
-            Path(path).resolve()
-        )
-    ).copy()
+    return load_audio_cached(str(Path(path).resolve())).copy()
 
 
-def random_segment(
-    audio,
-):
-    if len(audio) == 0:
-        return np.zeros(
-            SEGMENT_SAMPLES,
-            dtype=np.float32,
-        )
+def crop_pair(clean, noisy, segment_samples, start=None):
+    """
+    Crops (or pads) clean/noisy to the same segment, using the SAME
+    start offset for both since they're time-aligned recordings.
+    """
+    min_len = min(len(clean), len(noisy))
+    clean, noisy = clean[:min_len], noisy[:min_len]
 
-    if len(audio) >= SEGMENT_SAMPLES:
-        start = random.randint(
-            0,
-            len(audio)
-            - SEGMENT_SAMPLES,
+    if min_len >= segment_samples:
+        if start is None:
+            start = random.randint(0, min_len - segment_samples)
+        else:
+            start = start % (min_len - segment_samples + 1)
+        return (
+            clean[start:start + segment_samples],
+            noisy[start:start + segment_samples],
         )
 
-        return audio[
-            start:
-            start + SEGMENT_SAMPLES
-        ].astype(
-            np.float32
+    padded_clean = np.zeros(segment_samples, dtype=np.float32)
+    padded_noisy = np.zeros(segment_samples, dtype=np.float32)
+    padded_clean[:min_len] = clean
+    padded_noisy[:min_len] = noisy
+    return padded_clean, padded_noisy
+
+
+def pair_clean_noisy(clean_dir, noisy_dir):
+    """
+    Pairs clean/noisy files by matching filename (stem). Files that
+    only exist on one side are dropped, with a warning.
+    """
+    clean_by_stem = {f.stem: f for f in find_audio_files(clean_dir)}
+    noisy_by_stem = {f.stem: f for f in find_audio_files(noisy_dir)}
+
+    common = sorted(set(clean_by_stem) & set(noisy_by_stem))
+
+    only_clean = set(clean_by_stem) - set(noisy_by_stem)
+    only_noisy = set(noisy_by_stem) - set(clean_by_stem)
+
+    if only_clean:
+        print(
+            f"[WARNING] {len(only_clean)} clean files have no matching noisy "
+            f"file, skipping (e.g. {sorted(only_clean)[:3]})"
         )
 
-    padded = np.zeros(
-        SEGMENT_SAMPLES,
-        dtype=np.float32,
-    )
-
-    padded[
-        :len(audio)
-    ] = audio
-
-    return padded
-
-
-def prepare_noise(
-    noise,
-):
-    if len(noise) == 0:
-        return np.zeros(
-            SEGMENT_SAMPLES,
-            dtype=np.float32,
+    if only_noisy:
+        print(
+            f"[WARNING] {len(only_noisy)} noisy files have no matching clean "
+            f"file, skipping (e.g. {sorted(only_noisy)[:3]})"
         )
 
-    if len(noise) >= SEGMENT_SAMPLES:
-        return random_segment(
-            noise
-        )
-
-    repeats = int(
-        np.ceil(
-            SEGMENT_SAMPLES
-            / len(noise)
-        )
-    )
-
-    repeated = np.tile(
-        noise,
-        repeats,
-    )
-
-    return random_segment(
-        repeated
-    )
+    return [(clean_by_stem[s], noisy_by_stem[s]) for s in common]
 
 
-def mix_at_snr(
-    clean,
-    noise,
-    snr_db,
-):
-    clean = clean.astype(
-        np.float32
-    )
-
-    noise = noise.astype(
-        np.float32
-    )
-
-    clean_power = (
-        np.mean(
-            clean ** 2
-        )
-        + 1e-8
-    )
-
-    noise_power = (
-        np.mean(
-            noise ** 2
-        )
-        + 1e-8
-    )
-
-    target_noise_power = (
-        clean_power
-        / (
-            10.0
-            ** (
-                snr_db
-                / 10.0
-            )
-        )
-    )
-
-    noise_scale = np.sqrt(
-        target_noise_power
-        / noise_power
-    )
-
-    scaled_noise = (
-        noise
-        * noise_scale
-    )
-
-    noisy = (
-        clean
-        + scaled_noise
-    )
-
-    peak = float(
-        np.max(
-            np.abs(noisy)
-        )
-    )
-
-    if peak > 0.99:
-        scale = (
-            0.99 / peak
-        )
-
-        noisy *= scale
-        clean *= scale
-
-    return (
-        noisy.astype(np.float32),
-        clean.astype(np.float32),
-    )
-
-
-class SHAAudioDataset(
-    Dataset
-):
+class VoiceBankDataset(Dataset):
+    """
+    Dataset of pre-paired (clean, noisy) audio files, matched by filename.
+    """
 
     def __init__(
         self,
-        clean_files,
-        noise_files,
-        multiplier=DATASET_MULTIPLIER,
+        clean_dir=None,
+        noisy_dir=None,
+        pairs=None,
+        segment_samples=SEGMENT_SAMPLES,
         deterministic=False,
     ):
-        self.clean_files = list(
-            clean_files
-        )
-
-        self.noise_files = list(
-            noise_files
-        )
-
-        self.multiplier = max(
-            int(multiplier),
-            1,
-        )
-
-        self.deterministic = (
-            deterministic
-        )
-
-        if not self.clean_files:
-            raise RuntimeError(
-                "No clean speech files found."
+        if pairs is not None:
+            self.pairs = list(pairs)
+        elif clean_dir is not None and noisy_dir is not None:
+            self.pairs = pair_clean_noisy(clean_dir, noisy_dir)
+        else:
+            raise ValueError(
+                "Provide either 'pairs', or both 'clean_dir' and 'noisy_dir'."
             )
 
-        if not self.noise_files:
-            raise RuntimeError(
-                "No noise files found."
-            )
+        if not self.pairs:
+            raise RuntimeError("No matching clean/noisy file pairs found.")
+
+        self.segment_samples = segment_samples
+        self.deterministic = deterministic
 
     def __len__(self):
-        return (
-            len(self.clean_files)
-            * self.multiplier
-        )
+        return len(self.pairs)
 
-    def __getitem__(
-        self,
-        index,
-    ):
-        clean_index = (
-            index
-            % len(
-                self.clean_files
-            )
-        )
+    def __getitem__(self, index):
+        clean_path, noisy_path = self.pairs[index]
 
-        clean_path = (
-            self.clean_files[
-                clean_index
-            ]
-        )
+        clean = load_audio(clean_path)
+        noisy = load_audio(noisy_path)
 
-        if self.deterministic:
-            noise_index = (
-                index
-                % len(
-                    self.noise_files
-                )
-            )
+        start = index if self.deterministic else None
+        clean, noisy = crop_pair(clean, noisy, self.segment_samples, start=start)
 
-            noise_path = (
-                self.noise_files[
-                    noise_index
-                ]
-            )
+        noisy_tensor = torch.from_numpy(noisy.astype(np.float32)).unsqueeze(0)
+        clean_tensor = torch.from_numpy(clean.astype(np.float32)).unsqueeze(0)
 
-            rng = random.Random(
-                index + 12345
-            )
-
-            snr_db = rng.uniform(
-                SNR_MIN_DB,
-                SNR_MAX_DB,
-            )
-
-        else:
-            noise_path = random.choice(
-                self.noise_files
-            )
-
-            snr_db = random.uniform(
-                SNR_MIN_DB,
-                SNR_MAX_DB,
-            )
-
-        clean = load_audio(
-            clean_path
-        )
-
-        noise = load_audio(
-            noise_path
-        )
-
-        if self.deterministic:
-            if len(clean) >= SEGMENT_SAMPLES:
-                max_start = (
-                    len(clean)
-                    - SEGMENT_SAMPLES
-                )
-
-                start = (
-                    index
-                    % (
-                        max_start + 1
-                    )
-                )
-
-                clean = clean[
-                    start:
-                    start + SEGMENT_SAMPLES
-                ]
-
-            else:
-                clean = random_segment(
-                    clean
-                )
-
-        else:
-            clean = random_segment(
-                clean
-            )
-
-        noise = prepare_noise(
-            noise
-        )
-
-        noisy, clean = mix_at_snr(
-            clean,
-            noise,
-            snr_db,
-        )
-
-        noisy_tensor = (
-            torch.from_numpy(
-                noisy
-            )
-            .unsqueeze(0)
-        )
-
-        clean_tensor = (
-            torch.from_numpy(
-                clean
-            )
-            .unsqueeze(0)
-        )
-
-        return (
-            noisy_tensor,
-            clean_tensor,
-        )
+        return noisy_tensor, clean_tensor
 
 
-def split_files(
-    clean_files,
-    validation_ratio=VALIDATION_RATIO,
-):
-    files = list(
-        clean_files
-    )
+def split_pairs(pairs, validation_ratio=VALIDATION_RATIO):
+    pairs = list(pairs)
+    if len(pairs) < 2:
+        return pairs, pairs
 
-    if len(files) < 2:
-        return (
-            files,
-            files,
-        )
+    rng = random.Random(42)
+    rng.shuffle(pairs)
 
-    rng = random.Random(
-        42
-    )
-
-    rng.shuffle(
-        files
-    )
-
-    validation_count = max(
-        1,
-        int(
-            len(files)
-            * validation_ratio
-        ),
-    )
-
-    validation_files = files[
-        :validation_count
-    ]
-
-    training_files = files[
-        validation_count:
-    ]
-
-    return (
-        training_files,
-        validation_files,
-    )
-
-
-def discover_local_files():
-    clean_files = find_audio_files(
-        LIBRISPEECH_DIR
-    )
-
-    noise_files = find_audio_files(
-        MUSAN_DIR
-    )
-
-    return (
-        clean_files,
-        noise_files,
-    )
+    validation_count = max(1, int(len(pairs) * validation_ratio))
+    return pairs[validation_count:], pairs[:validation_count]
 
 
 def get_local_loaders(
     participant_id,
     batch_size=BATCH_SIZE,
+    max_samples=None,
 ):
-    clean_dir = Path(
-        LIBRISPEECH_DIR
-    )
-
-    noise_dir = Path(
-        MUSAN_DIR
-    )
-
     print()
-    print(
-        "-" * 70
-    )
+    print("-" * 70)
+    print(f"[{participant_id}] LOCAL DATASET")
+    print("-" * 70)
+    print(f"Train clean : {TRAIN_CLEAN_DIR}")
+    print(f"Train noisy : {TRAIN_NOISY_DIR}")
 
-    print(
-        f"[{participant_id}] LOCAL DATASET"
-    )
+    if max_samples is not None and max_samples > 0:
+        print(f"MAX SAMPLES : {max_samples} (TESTING MODE)")
 
-    print(
-        "-" * 70
-    )
-
-    print(
-        f"LibriSpeech : "
-        f"{clean_dir}"
-    )
-
-    print(
-        f"MUSAN       : "
-        f"{noise_dir}"
-    )
-
-    if not clean_dir.exists():
+    if not TRAIN_CLEAN_DIR.exists():
         raise RuntimeError(
-            f"[{participant_id}] "
-            f"LibriSpeech directory does not exist:\n"
-            f"{clean_dir}"
+            f"[{participant_id}] Train clean directory does not exist:\n{TRAIN_CLEAN_DIR}"
         )
-
-    if not noise_dir.exists():
+    if not TRAIN_NOISY_DIR.exists():
         raise RuntimeError(
-            f"[{participant_id}] "
-            f"MUSAN directory does not exist:\n"
-            f"{noise_dir}"
+            f"[{participant_id}] Train noisy directory does not exist:\n{TRAIN_NOISY_DIR}"
         )
 
-    clean_files = find_audio_files(
-        clean_dir
-    )
+    all_pairs = pair_clean_noisy(TRAIN_CLEAN_DIR, TRAIN_NOISY_DIR)
 
-    noise_files = find_audio_files(
-        noise_dir
-    )
+    if not all_pairs:
+        raise RuntimeError(f"[{participant_id}] No matching clean/noisy pairs found.")
 
-    if not clean_files:
-        raise RuntimeError(
-            f"[{participant_id}] "
-            "No LibriSpeech audio files found."
-        )
+    training_pairs, validation_pairs = split_pairs(all_pairs)
 
-    if not noise_files:
-        raise RuntimeError(
-            f"[{participant_id}] "
-            "No MUSAN audio files found."
-        )
+    if max_samples is not None and max_samples > 0:
+        val_samples = max(1, max_samples // 5)
 
-    (
-        training_files,
-        validation_files,
-    ) = split_files(
-        clean_files
-    )
+        if len(training_pairs) > max_samples:
+            training_pairs = training_pairs[:max_samples]
+            print(f"[{participant_id}] Training pairs limited to: {len(training_pairs)}")
 
-    training_dataset = (
-        SHAAudioDataset(
-            clean_files=training_files,
-            noise_files=noise_files,
-            multiplier=DATASET_MULTIPLIER,
-            deterministic=False,
-        )
-    )
+        if len(validation_pairs) > val_samples:
+            validation_pairs = validation_pairs[:val_samples]
+            print(f"[{participant_id}] Validation pairs limited to: {len(validation_pairs)}")
 
-    validation_dataset = (
-        SHAAudioDataset(
-            clean_files=validation_files,
-            noise_files=noise_files,
-            multiplier=1,
-            deterministic=True,
-        )
-    )
+    training_dataset = VoiceBankDataset(pairs=training_pairs, deterministic=False)
+    validation_dataset = VoiceBankDataset(pairs=validation_pairs, deterministic=True)
 
-    loader_workers = max(
-        int(DATALOADER_WORKERS),
-        0,
-    )
+    loader_workers = max(int(DATALOADER_WORKERS), 0)
 
     train_loader = DataLoader(
         training_dataset,
@@ -580,9 +229,7 @@ def get_local_loaders(
         num_workers=loader_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
-        persistent_workers=(
-            loader_workers > 0
-        ),
+        persistent_workers=(loader_workers > 0),
     )
 
     validation_loader = DataLoader(
@@ -592,72 +239,21 @@ def get_local_loaders(
         num_workers=loader_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
-        persistent_workers=(
-            loader_workers > 0
-        ),
+        persistent_workers=(loader_workers > 0),
     )
 
-    print(
-        f"Clean files : "
-        f"{len(clean_files)}"
-    )
+    print(f"Total pairs : {len(all_pairs)}")
+    print(f"Training    : {len(training_pairs)}")
+    print(f"Validation  : {len(validation_pairs)}")
+    print(f"DataLoader workers: {loader_workers}")
+    print("-" * 70)
 
-    print(
-        f"Noise files : "
-        f"{len(noise_files)}"
-    )
-
-    print(
-        f"Training    : "
-        f"{len(training_files)}"
-    )
-
-    print(
-        f"Validation  : "
-        f"{len(validation_files)}"
-    )
-
-    print(
-        f"Multiplier  : "
-        f"{DATASET_MULTIPLIER}"
-    )
-
-    print(
-        f"Train examples: "
-        f"{len(training_dataset)}"
-    )
-
-    print(
-        f"Validation examples: "
-        f"{len(validation_dataset)}"
-    )
-
-    print(
-        f"DataLoader workers: "
-        f"{loader_workers}"
-    )
-
-    print(
-        "-" * 70
-    )
-
-    return (
-        train_loader,
-        validation_loader,
-    )
+    return train_loader, validation_loader
 
 
-def get_worker_loader(
-    worker_id,
-    num_workers=None,
-    batch_size=BATCH_SIZE,
-):
-    (
-        train_loader,
-        _,
-    ) = get_local_loaders(
+def get_worker_loader(worker_id, num_workers=None, batch_size=BATCH_SIZE):
+    train_loader, _ = get_local_loaders(
         participant_id=f"WORKER {worker_id}",
         batch_size=batch_size,
     )
-
     return train_loader

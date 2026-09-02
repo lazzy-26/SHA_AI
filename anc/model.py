@@ -56,6 +56,17 @@ class SHAANCNet(nn.Module):
             dilation=1,
         )
 
+        # ------------------------------------------------------------
+        # Dilated stack.
+        #
+        # Extended from ...,64 up to ...,256 to widen the receptive
+        # field from ~514 samples (~32ms @ 16kHz) to ~2,042 samples
+        # (~128ms @ 16kHz). This lets the model use longer temporal
+        # context per prediction (helpful for nonstationary/reverberant
+        # noise) at a modest compute cost -- two extra causal conv
+        # blocks, same channel width.
+        # ------------------------------------------------------------
+
         self.blocks = nn.Sequential(
             CausalConvBlock(
                 channels,
@@ -91,6 +102,16 @@ class SHAANCNet(nn.Module):
                 channels,
                 channels,
                 dilation=64,
+            ),
+            CausalConvBlock(
+                channels,
+                channels,
+                dilation=128,
+            ),
+            CausalConvBlock(
+                channels,
+                channels,
+                dilation=256,
             ),
         )
 

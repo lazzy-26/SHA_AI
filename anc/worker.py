@@ -2,7 +2,6 @@ import argparse
 import pickle
 import socket
 import time
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -29,7 +28,7 @@ def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
     """
     Enable TCP keepalive on a socket to prevent NAT/routers from
     silently dropping idle connections.
-    
+
     Args:
         sock: The socket to configure
         idle_seconds: Seconds of idleness before sending first probe
@@ -37,7 +36,7 @@ def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
         max_probes: Number of unacknowledged probes before declaring dead
     """
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    
+
     # Linux-specific keepalive tuning (works on most systems)
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_seconds)
@@ -45,7 +44,7 @@ def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, max_probes)
     except (AttributeError, OSError):
         pass  # Not all systems support these options
-    
+
     # Windows-specific keepalive tuning
     try:
         if hasattr(socket, "SIO_KEEPALIVE_VALS"):
@@ -62,8 +61,7 @@ def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
 #
 # Every worker owns its own local:
 #
-#     LibriSpeech
-#     MUSAN
+#     VoiceBank-DEMAND (paired clean/noisy recordings)
 #
 # Only model weights and metrics are transmitted.
 #
@@ -391,7 +389,7 @@ class SHAANCWorker:
 
         print(
             f"[Worker {self.worker_id}] "
-            "Using local LibriSpeech/MUSAN dataset."
+            "Using local VoiceBank-DEMAND dataset."
         )
 
         if self.max_samples is not None:
@@ -420,7 +418,7 @@ class SHAANCWorker:
 
         print(
             f"[Worker {self.worker_id}] "
-            "LibriSpeech/MUSAN paths are local."
+            "VoiceBank-DEMAND paths are local."
         )
 
     # ========================================================
@@ -1011,7 +1009,7 @@ class SHAANCWorker:
             print(
                 f"[Worker {self.worker_id}] "
                 "Training local "
-                "LibriSpeech/MUSAN data..."
+                "VoiceBank-DEMAND data..."
             )
 
             try:

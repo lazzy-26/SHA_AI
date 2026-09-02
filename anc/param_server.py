@@ -19,6 +19,7 @@ from config import (
     LEARNING_RATE,
     MIN_IMPROVEMENT,
     NUM_PARTICIPANTS,
+    PATIENCE,
 )
 
 from dataset import get_local_loaders
@@ -33,7 +34,7 @@ def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
     """
     Enable TCP keepalive on a socket to prevent NAT/routers from
     silently dropping idle connections.
-    
+
     Args:
         sock: The socket to configure
         idle_seconds: Seconds of idleness before sending first probe
@@ -41,7 +42,7 @@ def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
         max_probes: Number of unacknowledged probes before declaring dead
     """
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    
+
     # Linux-specific keepalive tuning (works on most systems)
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_seconds)
@@ -49,7 +50,7 @@ def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, max_probes)
     except (AttributeError, OSError):
         pass  # Not all systems support these options
-    
+
     # Windows-specific keepalive tuning
     try:
         if hasattr(socket, "SIO_KEEPALIVE_VALS"):
@@ -84,7 +85,8 @@ def enable_keepalive(sock, idle_seconds=20, interval_seconds=10, max_probes=5):
 #     1. Parameter server
 #     2. Training participant
 #
-# Each participant keeps its own LibriSpeech/MUSAN dataset.
+# Each participant keeps its own VoiceBank-DEMAND dataset
+# (paired clean/noisy recordings).
 # Only model weights and metrics are exchanged.
 # ============================================================
 
@@ -98,7 +100,8 @@ class SHAANCParameterServer:
         epochs,
         batch_size=BATCH_SIZE,
         learning_rate=LEARNING_RATE,
-        participant_patience=MIN_IMPROVEMENT,
+        min_improvement=MIN_IMPROVEMENT,
+        participant_patience=PATIENCE,
         global_patience=GLOBAL_PATIENCE,
         ready_timeout=1800,
         max_samples=None,  # NEW: limit dataset size for fast testing
@@ -120,22 +123,19 @@ class SHAANCParameterServer:
 
         self.learning_rate = learning_rate
 
-        self.min_improvement = MIN_IMPROVEMENT
+        # LOSS delta required to count as "improved" (host early
+        # stopping). Keep distinct from participant_patience, which
+        # is a ROUND COUNT.
+        self.min_improvement = float(min_improvement)
 
-        self.participant_patience = (
-            max(
-                int(
-                    GLOBAL_PATIENCE
-                ),
-                1,
-            )
-            if participant_patience is None
-            else max(
-                int(
-                    participant_patience
-                ),
-                1,
-            )
+        # ROUND COUNT: how many rounds without sufficient improvement
+        # before the host stops local training. Defaults to PATIENCE
+        # from config (previously this incorrectly defaulted to
+        # MIN_IMPROVEMENT, a loss delta of 0.0005, which collapsed
+        # to a patience of ~1 round via int() truncation).
+        self.participant_patience = max(
+            int(participant_patience),
+            1,
         )
 
         self.global_patience = max(
@@ -146,7 +146,7 @@ class SHAANCParameterServer:
         # How long the host waits, at start(), for every
         # remote worker to connect AND send READY before
         # giving up. Increased from a 600s default -- real
-        # LibriSpeech/MUSAN datasets can take a while to
+        # VoiceBank-DEMAND datasets can take a while to
         # discover/index on slower machines.
         self.ready_timeout = max(
             int(ready_timeout),
@@ -1233,7 +1233,7 @@ class SHAANCParameterServer:
 
         print(
             "Workers are preparing their local "
-            "LibriSpeech/MUSAN datasets."
+            "VoiceBank-DEMAND datasets."
         )
 
         try:
@@ -1892,9 +1892,30 @@ def main():
     )
 
     parser.add_argument(
+        "--min-improvement",
+        type=float,
+        default=MIN_IMPROVEMENT,
+        help="Loss delta required to count as host improvement.",
+    )
+
+    parser.add_argument(
+        "--participant-patience",
+        type=int,
+        default=PATIENCE,
+        help=(
+            "Rounds without sufficient improvement before the "
+            "HOST stops local training."
+        ),
+    )
+
+    parser.add_argument(
         "--patience",
         type=int,
         default=GLOBAL_PATIENCE,
+        help=(
+            "Rounds without sufficient improvement before GLOBAL "
+            "training stops."
+        ),
     )
 
     parser.add_argument(
@@ -1924,6 +1945,8 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        min_improvement=args.min_improvement,
+        participant_patience=args.participant_patience,
         global_patience=args.patience,
         ready_timeout=args.ready_timeout,
         max_samples=args.max_samples,  # NEW
