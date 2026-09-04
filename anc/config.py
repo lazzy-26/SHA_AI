@@ -10,14 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 # ============================================================
-# AUDIO - OPTIMIZED FOR SPEED
+# AUDIO
 # ============================================================
 
 SAMPLE_RATE = 16000
 
-# SHORTER segments = faster training
-# 2 seconds is enough for speech enhancement to learn
-SEGMENT_SECONDS = 2  # Reduced from 3
+SEGMENT_SECONDS = 2
 
 SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS
 
@@ -26,38 +24,18 @@ SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS
 # LOCAL DATA SOURCES
 # ============================================================
 
-SOURCES_DIR = ROOT / "datasets" / "anc" / "raw"
+SOURCES_DIR = ROOT / "datasets" / "anc" / "sources"
 
-TRAIN_CLEAN_DIR = SOURCES_DIR / "train" / "clean"
-TRAIN_NOISY_DIR = SOURCES_DIR / "train" / "noisy"
-
-TEST_CLEAN_DIR = SOURCES_DIR / "test" / "clean"
-TEST_NOISY_DIR = SOURCES_DIR / "test" / "noisy"
-
-MUSAN_NOISE_DIR = ROOT / "datasets" / "anc" / "musan" / "noise"
+LIBRISPEECH_DIR = SOURCES_DIR / "librispeech"
+MUSAN_DIR = SOURCES_DIR / "musan"
 
 
 # Optional override
 if os.environ.get("SHA_SOURCES_DIR"):
     SOURCES_DIR = Path(os.environ["SHA_SOURCES_DIR"])
-    TRAIN_CLEAN_DIR = SOURCES_DIR / "train" / "clean"
-    TRAIN_NOISY_DIR = SOURCES_DIR / "train" / "noisy"
-    TEST_CLEAN_DIR = SOURCES_DIR / "test" / "clean"
-    TEST_NOISY_DIR = SOURCES_DIR / "test" / "noisy"
 
-if os.environ.get("SHA_MUSAN_NOISE_DIR"):
-    MUSAN_NOISE_DIR = Path(os.environ["SHA_MUSAN_NOISE_DIR"])
-
-
-# ============================================================
-# MUSAN AUGMENTATION (REDUCED FOR SPEED)
-# ============================================================
-
-# Lower ratio = faster because fewer mixed samples
-MUSAN_MIX_RATIO = 0.1  # Reduced from 0.25
-
-SNR_MIN_DB = -5
-SNR_MAX_DB = 15
+    LIBRISPEECH_DIR = SOURCES_DIR / "librispeech"
+    MUSAN_DIR = SOURCES_DIR / "musan"
 
 
 # ============================================================
@@ -65,6 +43,8 @@ SNR_MAX_DB = 15
 # ============================================================
 
 DEFAULT_WORKERS = 2
+
+# HOST + Worker 1 + Worker 2 = 3
 NUM_PARTICIPANTS = DEFAULT_WORKERS + 1
 
 
@@ -73,6 +53,7 @@ NUM_PARTICIPANTS = DEFAULT_WORKERS + 1
 # ============================================================
 
 HOST_IP = "170.20.10.2"
+
 DEFAULT_PORT = 8080
 
 
@@ -80,54 +61,77 @@ DEFAULT_PORT = 8080
 # NETWORK TIMEOUTS
 # ============================================================
 
-WORKER_SOCKET_TIMEOUT = 7200  # 2 hours
-READY_TIMEOUT = 600  # 10 minutes
-ROUND_TIMEOUT = 7200  # 2 hours
+# Dataset preparation can take some time
+READY_TIMEOUT = 1800       # 30 minutes
+
+# Maximum time allowed for a federated round
+ROUND_TIMEOUT = 3600       # 1 hour
+
+# Persistent worker sockets stay open
+WORKER_SOCKET_TIMEOUT = 0
 
 
 # ============================================================
-# TRAINING - OPTIMIZED FOR 2-HOUR RUN
+# TRAINING
 # ============================================================
 
-# Larger effective batch size via gradient accumulation
-BATCH_SIZE = 8
-GRADIENT_ACCUMULATION_STEPS = 4  # Effective batch size = 32
+# Larger batch = fewer optimizer iterations
+BATCH_SIZE = 32
 
-# Maximum epochs (early stopping will end earlier)
-EPOCHS = 50  # Reduced from 150
+# Effective batch size = 32 * 2 = 64
+GRADIENT_ACCUMULATION_STEPS = 2
 
-# Higher learning rate for faster convergence
-LEARNING_RATE = 5e-4  # Slightly higher than 3e-4
+# Fewer epochs so training does not run unnecessarily long
+EPOCHS = 15
 
-# DataLoader workers (more = faster loading)
-DATALOADER_WORKERS = 4  # Increased from 2
+LEARNING_RATE = 5e-4
+
+
+# ============================================================
+# DATA AUGMENTATION
+# ============================================================
+
+SNR_MIN_DB = -5
+
+SNR_MAX_DB = 15
+
+# Previously: 8
+# Lower this significantly to reduce preprocessing/training time.
+DATASET_MULTIPLIER = 3
+
+
+# ============================================================
+# DATALOADER
+# ============================================================
+
+# Increase this if your PC has multiple CPU cores.
+# Start with 2; if CPU usage is low, try 4.
+DATALOADER_WORKERS = 2
 
 
 # ============================================================
 # VALIDATION
 # ============================================================
 
-# Smaller validation set = faster validation
-VALIDATION_RATIO = 0.05  # Reduced from 0.10
+VALIDATION_RATIO = 0.05
 
 
 # ============================================================
-# EARLY STOPPING - MORE AGGRESSIVE
+# EARLY STOPPING
 # ============================================================
 
-# Less strict improvement threshold
-MIN_IMPROVEMENT = 0.001  # Increased from 0.0005
+MIN_IMPROVEMENT = 0.001
 
-# Fewer patience rounds = early stop sooner
-PATIENCE = 5  # Reduced from 10
+PATIENCE = 3
 
 
 # ============================================================
 # GLOBAL EARLY STOPPING
 # ============================================================
 
-GLOBAL_MIN_IMPROVEMENT = 0.001  # Increased
-GLOBAL_PATIENCE = 5  # Reduced from 10
+GLOBAL_MIN_IMPROVEMENT = 0.001
+
+GLOBAL_PATIENCE = 3
 
 
 # ============================================================
@@ -135,8 +139,22 @@ GLOBAL_PATIENCE = 5  # Reduced from 10
 # ============================================================
 
 CHECKPOINT_DIR = ROOT / "checkpoints" / "anc"
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+CHECKPOINT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
 GLOBAL_MODEL_PATH = CHECKPOINT_DIR / "sha_anc_global.pt"
+
+
+# ============================================================
+# AUDIO CACHE
+# ============================================================
+
+AUDIO_CACHE_DIR = ROOT / "audio_cache"
+
+AUDIO_CACHE_MAX_MEMORY_FILES = 1000
 
 
 # ============================================================
@@ -147,16 +165,31 @@ SEED = 42
 
 
 # ============================================================
-# 2-HOUR TRAINING PRESET
+# 1-HOUR TRAINING PRESET
 # ============================================================
 
 FAST_TRAINING = {
-    'max_samples': 3000,  # Sweet spot: enough data, not too slow
-    'epochs': 50,
-    'batch_size': 8,
-    'grad_accum_steps': 4,
-    'segment_seconds': 2,
-    'timeout': 7200,
-    'dataloader_workers': 4,
-    'early_stop_patience': 5,
+    # Limit the number of training samples
+    "max_samples": 5000,
+
+    # Maximum number of epochs
+    "epochs": 15,
+
+    # Larger batch for faster training
+    "batch_size": 32,
+
+    # Effective batch = 32 * 2 = 64
+    "grad_accum_steps": 2,
+
+    # Keep 2-second audio segments
+    "segment_seconds": 2,
+
+    # Maximum training/round time
+    "timeout": 3600,
+
+    # Parallel audio loading
+    "dataloader_workers": 2,
+
+    # Stop earlier if model stops improving
+    "early_stop_patience": 3,
 }
