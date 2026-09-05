@@ -21,30 +21,83 @@ SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS
 
 
 # ============================================================
-# LOCAL DATA SOURCES
+# ANC DATASET
+#
+# Prepared dataset:
+#
+# datasets/
+# └── anc/
+#     ├── dataset/
+#     │   └── musan/
+#     │       └── noise/
+#     │
+#     └── raw/
+#         ├── train/
+#         │   ├── clean/
+#         │   └── noisy/
+#         │
+#         └── test/
+#             ├── clean/
+#             └── noisy/
 # ============================================================
 
-SOURCES_DIR = ROOT / "datasets" / "anc" / "sources"
+ANC_DIR = ROOT / "datasets" / "anc"
 
-LIBRISPEECH_DIR = SOURCES_DIR / "librispeech"
-MUSAN_DIR = SOURCES_DIR / "musan"
+RAW_DIR = ANC_DIR / "raw"
+
+TRAIN_DIR = RAW_DIR / "train"
+TEST_DIR = RAW_DIR / "test"
+
+TRAIN_CLEAN_DIR = TRAIN_DIR / "clean"
+TRAIN_NOISY_DIR = TRAIN_DIR / "noisy"
+
+TEST_CLEAN_DIR = TEST_DIR / "clean"
+TEST_NOISY_DIR = TEST_DIR / "noisy"
 
 
-# Optional override
-if os.environ.get("SHA_SOURCES_DIR"):
-    SOURCES_DIR = Path(os.environ["SHA_SOURCES_DIR"])
+# ============================================================
+# MUSAN
+#
+# Kept for optional future augmentation.
+# It is NOT required for the prepared-dataset training path.
+# ============================================================
 
-    LIBRISPEECH_DIR = SOURCES_DIR / "librispeech"
-    MUSAN_DIR = SOURCES_DIR / "musan"
+MUSAN_DIR = ANC_DIR / "dataset" / "musan"
+
+MUSAN_NOISE_DIR = MUSAN_DIR / "noise"
+
+
+# ============================================================
+# OPTIONAL DATASET OVERRIDE
+# ============================================================
+
+if os.environ.get("SHA_ANC_DIR"):
+    ANC_DIR = Path(
+        os.environ["SHA_ANC_DIR"]
+    )
+
+    RAW_DIR = ANC_DIR / "raw"
+
+    TRAIN_DIR = RAW_DIR / "train"
+    TEST_DIR = RAW_DIR / "test"
+
+    TRAIN_CLEAN_DIR = TRAIN_DIR / "clean"
+    TRAIN_NOISY_DIR = TRAIN_DIR / "noisy"
+
+    TEST_CLEAN_DIR = TEST_DIR / "clean"
+    TEST_NOISY_DIR = TEST_DIR / "noisy"
+
+    MUSAN_DIR = ANC_DIR / "dataset" / "musan"
+    MUSAN_NOISE_DIR = MUSAN_DIR / "noise"
 
 
 # ============================================================
 # FEDERATED PARTICIPANTS
 # ============================================================
 
-DEFAULT_WORKERS = 2
+DEFAULT_WORKERS = 3
 
-# HOST + Worker 1 + Worker 2 = 3
+# HOST + Worker 1 + Worker 2
 NUM_PARTICIPANTS = DEFAULT_WORKERS + 1
 
 
@@ -61,13 +114,10 @@ DEFAULT_PORT = 8080
 # NETWORK TIMEOUTS
 # ============================================================
 
-# Dataset preparation can take some time
 READY_TIMEOUT = 1800       # 30 minutes
 
-# Maximum time allowed for a federated round
 ROUND_TIMEOUT = 3600       # 1 hour
 
-# Persistent worker sockets stay open
 WORKER_SOCKET_TIMEOUT = 0
 
 
@@ -75,37 +125,30 @@ WORKER_SOCKET_TIMEOUT = 0
 # TRAINING
 # ============================================================
 
-# Larger batch = fewer optimizer iterations
 BATCH_SIZE = 32
 
-# Effective batch size = 32 * 2 = 64
 GRADIENT_ACCUMULATION_STEPS = 2
 
-# Fewer epochs so training does not run unnecessarily long
 EPOCHS = 15
 
 LEARNING_RATE = 5e-4
 
 
 # ============================================================
-# DATA AUGMENTATION
+# DATASET
 # ============================================================
 
-SNR_MIN_DB = -5
-
-SNR_MAX_DB = 15
-
-# Previously: 8
-# Lower this significantly to reduce preprocessing/training time.
-DATASET_MULTIPLIER = 3
+# Kept for compatibility with code that still imports this.
+#
+# Since raw/train already contains prepared noisy examples,
+# the multiplier is NOT used to regenerate audio.
+DATASET_MULTIPLIER = 1
 
 
 # ============================================================
 # DATALOADER
 # ============================================================
 
-# Increase this if your PC has multiple CPU cores.
-# Start with 2; if CPU usage is low, try 4.
 DATALOADER_WORKERS = 2
 
 
@@ -145,7 +188,9 @@ CHECKPOINT_DIR.mkdir(
     exist_ok=True,
 )
 
-GLOBAL_MODEL_PATH = CHECKPOINT_DIR / "sha_anc_global.pt"
+GLOBAL_MODEL_PATH = (
+    CHECKPOINT_DIR / "sha_anc_global.pt"
+)
 
 
 # ============================================================
@@ -165,31 +210,16 @@ SEED = 42
 
 
 # ============================================================
-# 1-HOUR TRAINING PRESET
+# FAST / 1-HOUR PRESET
 # ============================================================
 
 FAST_TRAINING = {
-    # Limit the number of training samples
-    "max_samples": 5000,
-
-    # Maximum number of epochs
+    "max_samples": 3000,
     "epochs": 15,
-
-    # Larger batch for faster training
     "batch_size": 32,
-
-    # Effective batch = 32 * 2 = 64
     "grad_accum_steps": 2,
-
-    # Keep 2-second audio segments
     "segment_seconds": 2,
-
-    # Maximum training/round time
     "timeout": 3600,
-
-    # Parallel audio loading
     "dataloader_workers": 2,
-
-    # Stop earlier if model stops improving
     "early_stop_patience": 3,
 }

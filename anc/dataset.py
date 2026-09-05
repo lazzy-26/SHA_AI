@@ -1,6 +1,5 @@
 import hashlib
 import pickle
-import random
 from pathlib import Path
 
 import numpy as np
@@ -13,16 +12,14 @@ from config import (
     AUDIO_CACHE_DIR,
     AUDIO_CACHE_MAX_MEMORY_FILES,
     BATCH_SIZE,
-    DATASET_MULTIPLIER,
     DATALOADER_WORKERS,
-    LIBRISPEECH_DIR,
-    MUSAN_DIR,
     SAMPLE_RATE,
     SEGMENT_SAMPLES,
     SEED,
-    SNR_MAX_DB,
-    SNR_MIN_DB,
-    VALIDATION_RATIO,
+    TRAIN_CLEAN_DIR,
+    TRAIN_NOISY_DIR,
+    TEST_CLEAN_DIR,
+    TEST_NOISY_DIR,
 )
 
 
@@ -30,9 +27,8 @@ from config import (
 # REPRODUCIBILITY
 # ============================================================
 
-random.seed(SEED)
-np.random.seed(SEED)
 torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 
 # ============================================================
@@ -50,6 +46,7 @@ def find_audio_files(directory):
     """
     Recursively find supported audio files.
     """
+
     directory = Path(directory)
 
     if not directory.exists():
@@ -58,7 +55,12 @@ def find_audio_files(directory):
     files = []
 
     for path in directory.rglob("*"):
-        if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
+
+        if (
+            path.is_file()
+            and path.suffix.lower()
+            in AUDIO_EXTENSIONS
+        ):
             files.append(path)
 
     files.sort()
@@ -72,10 +74,10 @@ def find_audio_files(directory):
 
 def _load_audio_uncached(path):
     """
-    Load one audio file from disk.
+    Load audio from disk.
 
-    This is the ONLY function that performs the actual disk read.
-    The cache calls this function when necessary.
+    This is the ONLY function that performs
+    the actual audio disk read.
     """
 
     path = Path(path)
@@ -86,13 +88,26 @@ def _load_audio_uncached(path):
         always_2d=False,
     )
 
-    audio = np.asarray(audio, dtype=np.float32)
+    audio = np.asarray(
+        audio,
+        dtype=np.float32,
+    )
 
-    # Convert stereo/multichannel to mono
+    # --------------------------------------------------------
+    # MONO
+    # --------------------------------------------------------
+
     if audio.ndim > 1:
-        audio = np.mean(audio, axis=1)
 
-    # Remove NaN / infinity
+        audio = np.mean(
+            audio,
+            axis=1,
+        )
+
+    # --------------------------------------------------------
+    # REMOVE INVALID VALUES
+    # --------------------------------------------------------
+
     audio = np.nan_to_num(
         audio,
         nan=0.0,
@@ -100,21 +115,35 @@ def _load_audio_uncached(path):
         neginf=0.0,
     )
 
-    # Resample
+    # --------------------------------------------------------
+    # RESAMPLE
+    # --------------------------------------------------------
+
     if sample_rate != SAMPLE_RATE:
+
         audio = resample_poly(
             audio,
             SAMPLE_RATE,
             sample_rate,
         ).astype(np.float32)
 
-    # Peak normalization
-    peak = np.max(np.abs(audio))
+    # --------------------------------------------------------
+    # NORMALIZE
+    # --------------------------------------------------------
+
+    peak = np.max(
+        np.abs(audio)
+    )
 
     if peak > 1e-8:
-        audio = audio / peak
 
-    return audio.astype(np.float32)
+        audio = (
+            audio / peak
+        )
+
+    return audio.astype(
+        np.float32
+    )
 
 
 # ============================================================
@@ -126,14 +155,13 @@ class AudioCache:
     Two-level audio cache.
 
     Level 1:
-        In-memory dictionary.
+        RAM
 
     Level 2:
-        Pickled audio files on disk.
+        Disk
 
-    IMPORTANT:
-        This class NEVER calls load_audio().
-        It calls _load_audio_uncached() to avoid recursion.
+    Level 3:
+        Original WAV file
     """
 
     def __init__(
@@ -141,11 +169,16 @@ class AudioCache:
         max_size=AUDIO_CACHE_MAX_MEMORY_FILES,
         cache_dir=AUDIO_CACHE_DIR,
     ):
+
         self.cache = {}
 
-        self.max_size = int(max_size)
+        self.max_size = int(
+            max_size
+        )
 
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = Path(
+            cache_dir
+        )
 
         self.cache_dir.mkdir(
             parents=True,
@@ -155,17 +188,18 @@ class AudioCache:
         self.hits = 0
         self.misses = 0
 
+    # --------------------------------------------------------
+    # CACHE FILE NAME
+    # --------------------------------------------------------
+
     def _cache_filename(self, path):
-        """
-        Generate a stable cache filename.
 
-        File path + modification time + size are included so
-        changing the source audio invalidates the old cache.
-        """
-
-        path = Path(path).resolve()
+        path = Path(
+            path
+        ).resolve()
 
         try:
+
             stat = path.stat()
 
             signature = (
@@ -175,50 +209,73 @@ class AudioCache:
             )
 
         except OSError:
+
             signature = str(path)
 
         digest = hashlib.md5(
-            signature.encode("utf-8")
+            signature.encode(
+                "utf-8"
+            )
         ).hexdigest()
 
-        return self.cache_dir / f"{digest}.pkl"
+        return (
+            self.cache_dir
+            / f"{digest}.pkl"
+        )
+
+    # --------------------------------------------------------
+    # GET
+    # --------------------------------------------------------
 
     def get(self, path):
-        """
-        Get audio from memory cache, disk cache, or source file.
-        """
 
         path = str(
             Path(path).resolve()
         )
 
         # ----------------------------------------------------
-        # MEMORY CACHE
+        # RAM
         # ----------------------------------------------------
 
         if path in self.cache:
+
             self.hits += 1
+
             return self.cache[path]
 
         # ----------------------------------------------------
-        # DISK CACHE
+        # DISK
         # ----------------------------------------------------
 
-        cache_file = self._cache_filename(path)
+        cache_file = (
+            self._cache_filename(path)
+        )
 
         if cache_file.exists():
 
             try:
-                with cache_file.open("rb") as file:
-                    audio = pickle.load(file)
+
+                with cache_file.open(
+                    "rb"
+                ) as file:
+
+                    audio = pickle.load(
+                        file
+                    )
 
                 audio = np.asarray(
                     audio,
                     dtype=np.float32,
                 )
 
-                if len(self.cache) < self.max_size:
-                    self.cache[path] = audio
+                if (
+                    len(self.cache)
+                    < self.max_size
+                ):
+
+                    self.cache[
+                        path
+                    ] = audio
 
                 self.hits += 1
 
@@ -230,49 +287,81 @@ class AudioCache:
                 pickle.PickleError,
                 ValueError,
             ):
+
                 try:
+
                     cache_file.unlink()
+
                 except OSError:
+
                     pass
 
         # ----------------------------------------------------
-        # ACTUAL DISK AUDIO READ
+        # ORIGINAL FILE
         # ----------------------------------------------------
 
-        audio = _load_audio_uncached(path)
+        audio = _load_audio_uncached(
+            path
+        )
 
         # ----------------------------------------------------
         # SAVE DISK CACHE
         # ----------------------------------------------------
 
         try:
-            with cache_file.open("wb") as file:
+
+            with cache_file.open(
+                "wb"
+            ) as file:
+
                 pickle.dump(
                     audio,
                     file,
                     protocol=pickle.HIGHEST_PROTOCOL,
                 )
+
         except OSError:
+
             pass
 
         # ----------------------------------------------------
-        # SAVE MEMORY CACHE
+        # SAVE RAM CACHE
         # ----------------------------------------------------
 
-        if len(self.cache) < self.max_size:
-            self.cache[path] = audio
+        if (
+            len(self.cache)
+            < self.max_size
+        ):
+
+            self.cache[
+                path
+            ] = audio
 
         self.misses += 1
 
         return audio
 
+    # --------------------------------------------------------
+    # STATS
+    # --------------------------------------------------------
+
     def stats(self):
-        total = self.hits + self.misses
+
+        total = (
+            self.hits
+            + self.misses
+        )
 
         if total == 0:
+
             hit_rate = 0.0
+
         else:
-            hit_rate = self.hits / total
+
+            hit_rate = (
+                self.hits
+                / total
+            )
 
         return (
             f"Cache hit rate: "
@@ -286,20 +375,23 @@ _audio_cache = AudioCache()
 
 
 def load_audio(path):
-    """
-    Public cached audio loader.
-    """
 
-    return _audio_cache.get(path)
+    return _audio_cache.get(
+        path
+    )
 
 
 # ============================================================
-# AUDIO SEGMENTATION
+# FIXED-LENGTH SEGMENT
 # ============================================================
 
-def random_segment(audio):
+def fixed_segment(audio):
     """
     Return exactly SEGMENT_SAMPLES samples.
+
+    For prepared datasets we use a deterministic
+    center crop/padding rather than generating
+    a new random example every access.
     """
 
     audio = np.asarray(
@@ -309,23 +401,25 @@ def random_segment(audio):
 
     length = len(audio)
 
-    # Exact length
+    # Exact
     if length == SEGMENT_SAMPLES:
+
         return audio.copy()
 
-    # Longer than required -> random crop
+    # Longer
     if length > SEGMENT_SAMPLES:
 
-        start = random.randint(
-            0,
-            length - SEGMENT_SAMPLES,
-        )
+        start = (
+            length
+            - SEGMENT_SAMPLES
+        ) // 2
 
         return audio[
-            start:start + SEGMENT_SAMPLES
+            start:
+            start + SEGMENT_SAMPLES
         ].copy()
 
-    # Shorter -> zero pad
+    # Shorter
     result = np.zeros(
         SEGMENT_SAMPLES,
         dtype=np.float32,
@@ -337,193 +431,108 @@ def random_segment(audio):
 
 
 # ============================================================
-# NOISE PREPARATION
+# PREPARED PAIRED DATASET
 # ============================================================
 
-def prepare_noise(noise):
+class SHAPairedAudioDataset(Dataset):
     """
-    Return a noise segment with exactly SEGMENT_SAMPLES samples.
+    Dataset using already-prepared pairs:
+
+        clean/
+        noisy/
+
+    No MUSAN mixing happens during training.
+
+    This significantly reduces CPU work.
     """
-
-    noise = np.asarray(
-        noise,
-        dtype=np.float32,
-    )
-
-    if len(noise) == 0:
-        return np.zeros(
-            SEGMENT_SAMPLES,
-            dtype=np.float32,
-        )
-
-    # If noise is long enough, random crop
-    if len(noise) >= SEGMENT_SAMPLES:
-        return random_segment(noise)
-
-    # If short, repeat it
-    repeats = (
-        SEGMENT_SAMPLES // len(noise)
-    ) + 1
-
-    noise = np.tile(
-        noise,
-        repeats,
-    )
-
-    return random_segment(noise)
-
-
-# ============================================================
-# MIXING
-# ============================================================
-
-def mix_at_snr(
-    clean,
-    noise,
-    snr_db,
-):
-    """
-    Mix clean speech and noise at the requested SNR.
-    """
-
-    clean = np.asarray(
-        clean,
-        dtype=np.float32,
-    )
-
-    noise = np.asarray(
-        noise,
-        dtype=np.float32,
-    )
-
-    clean_power = np.mean(
-        clean ** 2
-    )
-
-    noise_power = np.mean(
-        noise ** 2
-    )
-
-    if noise_power < 1e-10:
-        return clean.copy()
-
-    # Desired noise power
-    desired_noise_power = (
-        clean_power
-        / (10.0 ** (snr_db / 10.0))
-    )
-
-    scale = np.sqrt(
-        desired_noise_power
-        / (noise_power + 1e-12)
-    )
-
-    scaled_noise = noise * scale
-
-    noisy = clean + scaled_noise
-
-    # Prevent clipping
-    peak = np.max(
-        np.abs(noisy)
-    )
-
-    if peak > 1.0:
-        noisy = noisy / peak
-
-    return noisy.astype(np.float32)
-
-
-# ============================================================
-# DATASET
-# ============================================================
-
-class SHAAudioDataset(Dataset):
 
     def __init__(
         self,
         clean_files,
-        noise_files,
-        multiplier=DATASET_MULTIPLIER,
+        noisy_files,
     ):
 
-        self.clean_files = list(clean_files)
+        self.clean_files = list(
+            clean_files
+        )
 
-        self.noise_files = list(noise_files)
-
-        self.multiplier = max(
-            int(multiplier),
-            1,
+        self.noisy_files = list(
+            noisy_files
         )
 
         if not self.clean_files:
+
             raise RuntimeError(
-                "No clean audio files were supplied."
+                "No clean audio files found."
             )
 
-        if not self.noise_files:
+        if not self.noisy_files:
+
             raise RuntimeError(
-                "No noise audio files were supplied."
+                "No noisy audio files found."
+            )
+
+        if (
+            len(self.clean_files)
+            != len(self.noisy_files)
+        ):
+
+            raise RuntimeError(
+                "Clean/noisy dataset size mismatch:\n"
+                f"Clean: {len(self.clean_files)}\n"
+                f"Noisy: {len(self.noisy_files)}"
             )
 
     def __len__(self):
 
-        return (
-            len(self.clean_files)
-            * self.multiplier
+        return len(
+            self.clean_files
         )
 
-    def __getitem__(self, index):
+    def __getitem__(
+        self,
+        index,
+    ):
 
-        # Different generated sample can use
-        # the same clean source.
-        clean_index = (
-            index
-            % len(self.clean_files)
+        clean_path = (
+            self.clean_files[index]
         )
 
-        clean_path = self.clean_files[
-            clean_index
-        ]
-
-        # Random noise
-        noise_path = random.choice(
-            self.noise_files
+        noisy_path = (
+            self.noisy_files[index]
         )
 
         clean_audio = load_audio(
             clean_path
         )
 
-        noise_audio = load_audio(
-            noise_path
+        noisy_audio = load_audio(
+            noisy_path
         )
 
-        clean = random_segment(
+        clean = fixed_segment(
             clean_audio
         )
 
-        noise = prepare_noise(
-            noise_audio
+        noisy = fixed_segment(
+            noisy_audio
         )
 
-        snr_db = random.uniform(
-            SNR_MIN_DB,
-            SNR_MAX_DB,
+        noisy_tensor = (
+            torch.from_numpy(
+                noisy
+            )
+            .float()
+            .unsqueeze(0)
         )
 
-        noisy = mix_at_snr(
-            clean,
-            noise,
-            snr_db,
+        clean_tensor = (
+            torch.from_numpy(
+                clean
+            )
+            .float()
+            .unsqueeze(0)
         )
-
-        noisy_tensor = torch.from_numpy(
-            noisy
-        ).float().unsqueeze(0)
-
-        clean_tensor = torch.from_numpy(
-            clean
-        ).float().unsqueeze(0)
 
         return (
             noisy_tensor,
@@ -532,49 +541,91 @@ class SHAAudioDataset(Dataset):
 
 
 # ============================================================
-# DATASET SPLITTING
+# MATCH CLEAN/NOISY FILES
 # ============================================================
 
-def split_clean_files(
+def build_pairs(
     clean_files,
-    validation_ratio=VALIDATION_RATIO,
+    noisy_files,
 ):
     """
-    Deterministic train/validation split.
+    Match clean and noisy files.
+
+    First attempts exact filename matching.
+
+    If names don't match, falls back to
+    sorted positional matching.
     """
 
-    clean_files = list(clean_files)
+    clean_files = list(
+        clean_files
+    )
 
-    if len(clean_files) < 2:
-        raise RuntimeError(
-            "At least 2 clean audio files are required "
-            "for train/validation splitting."
+    noisy_files = list(
+        noisy_files
+    )
+
+    if not clean_files:
+        return []
+
+    if not noisy_files:
+        return []
+
+    noisy_by_name = {
+        path.name: path
+        for path in noisy_files
+    }
+
+    pairs = []
+
+    # --------------------------------------------------------
+    # Exact filename matching
+    # --------------------------------------------------------
+
+    for clean in clean_files:
+
+        noisy = noisy_by_name.get(
+            clean.name
         )
 
-    rng = random.Random(SEED)
+        if noisy is not None:
 
-    rng.shuffle(clean_files)
+            pairs.append(
+                (
+                    clean,
+                    noisy,
+                )
+            )
 
-    validation_count = max(
-        1,
-        int(
-            len(clean_files)
-            * validation_ratio
-        ),
-    )
+    # --------------------------------------------------------
+    # If filenames don't match, use sorted order
+    # --------------------------------------------------------
 
-    validation_files = clean_files[
-        :validation_count
-    ]
+    if len(pairs) != len(
+        clean_files
+    ):
 
-    train_files = clean_files[
-        validation_count:
-    ]
+        clean_sorted = sorted(
+            clean_files
+        )
 
-    return (
-        train_files,
-        validation_files,
-    )
+        noisy_sorted = sorted(
+            noisy_files
+        )
+
+        count = min(
+            len(clean_sorted),
+            len(noisy_sorted),
+        )
+
+        pairs = list(
+            zip(
+                clean_sorted[:count],
+                noisy_sorted[:count],
+            )
+        )
+
+    return pairs
 
 
 # ============================================================
@@ -587,86 +638,127 @@ def get_local_loaders(
     max_samples=None,
 ):
     """
-    Prepare a local dataset for one participant.
+    Prepare the local participant dataset.
 
-    Every participant reads from its OWN PC:
+    Training:
+        datasets/anc/raw/train/clean
+        datasets/anc/raw/train/noisy
 
-        sources/librispeech
-        sources/musan
+    Validation:
+        datasets/anc/raw/test/clean
+        datasets/anc/raw/test/noisy
 
-    No network dataset is accessed.
+    MUSAN is NOT required here.
     """
 
     print()
-    print("-" * 70)
+    print("=" * 70)
     print(
-        f"[{participant_id}] PREPARING LOCAL AUDIO DATASET"
+        f"[{participant_id}] PREPARING LOCAL DATASET"
     )
-    print("-" * 70)
+    print("=" * 70)
 
     print(
-        f"[{participant_id}] LibriSpeech: "
-        f"{LIBRISPEECH_DIR}"
+        f"[{participant_id}] "
+        f"Train clean: {TRAIN_CLEAN_DIR}"
     )
 
     print(
-        f"[{participant_id}] MUSAN: "
-        f"{MUSAN_DIR}"
+        f"[{participant_id}] "
+        f"Train noisy: {TRAIN_NOISY_DIR}"
     )
 
-    # --------------------------------------------------------
+    print(
+        f"[{participant_id}] "
+        f"Test clean: {TEST_CLEAN_DIR}"
+    )
+
+    print(
+        f"[{participant_id}] "
+        f"Test noisy: {TEST_NOISY_DIR}"
+    )
+
+    # ========================================================
     # CHECK DIRECTORIES
-    # --------------------------------------------------------
+    # ========================================================
 
-    if not LIBRISPEECH_DIR.exists():
-        raise FileNotFoundError(
-            f"[{participant_id}] LibriSpeech directory "
-            f"does not exist:\n{LIBRISPEECH_DIR}"
+    required_dirs = [
+        TRAIN_CLEAN_DIR,
+        TRAIN_NOISY_DIR,
+        TEST_CLEAN_DIR,
+        TEST_NOISY_DIR,
+    ]
+
+    for directory in required_dirs:
+
+        if not directory.exists():
+
+            raise FileNotFoundError(
+                f"[{participant_id}] "
+                f"Required dataset directory "
+                f"does not exist:\n"
+                f"{directory}"
+            )
+
+    # ========================================================
+    # FIND TRAINING FILES
+    # ========================================================
+
+    train_clean_files = (
+        find_audio_files(
+            TRAIN_CLEAN_DIR
         )
-
-    if not MUSAN_DIR.exists():
-        raise FileNotFoundError(
-            f"[{participant_id}] MUSAN directory "
-            f"does not exist:\n{MUSAN_DIR}"
-        )
-
-    # --------------------------------------------------------
-    # FIND AUDIO
-    # --------------------------------------------------------
-
-    clean_files = find_audio_files(
-        LIBRISPEECH_DIR
     )
 
-    noise_files = find_audio_files(
-        MUSAN_DIR
+    train_noisy_files = (
+        find_audio_files(
+            TRAIN_NOISY_DIR
+        )
+    )
+
+    # ========================================================
+    # FIND TEST FILES
+    # ========================================================
+
+    test_clean_files = (
+        find_audio_files(
+            TEST_CLEAN_DIR
+        )
+    )
+
+    test_noisy_files = (
+        find_audio_files(
+            TEST_NOISY_DIR
+        )
     )
 
     print(
-        f"[{participant_id}] Clean files found: "
-        f"{len(clean_files)}"
+        f"[{participant_id}] "
+        f"Train clean files: "
+        f"{len(train_clean_files)}"
     )
 
     print(
-        f"[{participant_id}] Noise files found: "
-        f"{len(noise_files)}"
+        f"[{participant_id}] "
+        f"Train noisy files: "
+        f"{len(train_noisy_files)}"
     )
 
-    if not clean_files:
-        raise RuntimeError(
-            f"[{participant_id}] No LibriSpeech "
-            "audio files were found."
-        )
+    print(
+        f"[{participant_id}] "
+        f"Test clean files: "
+        f"{len(test_clean_files)}"
+    )
 
-    if not noise_files:
-        raise RuntimeError(
-            f"[{participant_id}] No MUSAN "
-            "audio files were found."
-        )
+    print(
+        f"[{participant_id}] "
+        f"Test noisy files: "
+        f"{len(test_noisy_files)}"
+    )
 
-    # --------------------------------------------------------
-    # LIMIT DATASET FOR TESTING
-    # --------------------------------------------------------
+    # ========================================================
+    # LIMIT TRAINING DATA
+    # ========================================================
 
     if max_samples is not None:
 
@@ -674,76 +766,153 @@ def get_local_loaders(
             max_samples
         )
 
-        if max_samples < 2:
+        if max_samples < 1:
+
             raise ValueError(
-                "max_samples must be at least 2."
+                "max_samples must be at least 1."
             )
 
-        if max_samples < len(clean_files):
+        if (
+            max_samples
+            < len(train_clean_files)
+        ):
 
-            rng = random.Random(
+            rng = np.random.default_rng(
                 SEED
             )
 
-            clean_files = rng.sample(
-                clean_files,
-                max_samples,
+            indices = rng.choice(
+                len(train_clean_files),
+                size=max_samples,
+                replace=False,
             )
 
-            print(
-                f"[{participant_id}] "
-                f"Limited clean files to "
-                f"{len(clean_files)}"
+            indices = sorted(
+                indices.tolist()
             )
 
-    # --------------------------------------------------------
-    # TRAIN / VALIDATION SPLIT
-    # --------------------------------------------------------
+            train_clean_files = [
+                train_clean_files[i]
+                for i in indices
+            ]
 
-    (
-        train_clean_files,
-        validation_clean_files,
-    ) = split_clean_files(
-        clean_files
+            # We need the corresponding noisy
+            # files. Build the pairs before limiting
+            # when possible.
+            train_pairs = build_pairs(
+                find_audio_files(
+                    TRAIN_CLEAN_DIR
+                ),
+                find_audio_files(
+                    TRAIN_NOISY_DIR
+                ),
+            )
+
+            train_pairs = [
+                train_pairs[i]
+                for i in indices
+                if i < len(train_pairs)
+            ]
+
+        else:
+
+            train_pairs = build_pairs(
+                train_clean_files,
+                train_noisy_files,
+            )
+
+    else:
+
+        train_pairs = build_pairs(
+            train_clean_files,
+            train_noisy_files,
+        )
+
+    # ========================================================
+    # TEST PAIRS
+    # ========================================================
+
+    test_pairs = build_pairs(
+        test_clean_files,
+        test_noisy_files,
     )
 
-    print(
-        f"[{participant_id}] Training files: "
-        f"{len(train_clean_files)}"
-    )
+    # ========================================================
+    # CHECK PAIRS
+    # ========================================================
 
-    print(
-        f"[{participant_id}] Validation files: "
-        f"{len(validation_clean_files)}"
-    )
+    if not train_pairs:
 
-    # --------------------------------------------------------
+        raise RuntimeError(
+            f"[{participant_id}] "
+            "No training clean/noisy pairs found."
+        )
+
+    if not test_pairs:
+
+        raise RuntimeError(
+            f"[{participant_id}] "
+            "No validation clean/noisy pairs found."
+        )
+
+    # ========================================================
+    # UNPACK
+    # ========================================================
+
+    train_clean = [
+        pair[0]
+        for pair in train_pairs
+    ]
+
+    train_noisy = [
+        pair[1]
+        for pair in train_pairs
+    ]
+
+    test_clean = [
+        pair[0]
+        for pair in test_pairs
+    ]
+
+    test_noisy = [
+        pair[1]
+        for pair in test_pairs
+    ]
+
+    # ========================================================
     # DATASETS
-    # --------------------------------------------------------
+    # ========================================================
 
-    train_dataset = SHAAudioDataset(
-        clean_files=train_clean_files,
-        noise_files=noise_files,
-        multiplier=DATASET_MULTIPLIER,
+    train_dataset = (
+        SHAPairedAudioDataset(
+            clean_files=train_clean,
+            noisy_files=train_noisy,
+        )
     )
 
-    validation_dataset = SHAAudioDataset(
-        clean_files=validation_clean_files,
-        noise_files=noise_files,
-        multiplier=1,
+    validation_dataset = (
+        SHAPairedAudioDataset(
+            clean_files=test_clean,
+            noisy_files=test_noisy,
+        )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DATALOADERS
-    # --------------------------------------------------------
+    # ========================================================
+
+    pin_memory = torch.cuda.is_available()
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=DATALOADER_WORKERS,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=pin_memory,
         drop_last=False,
+        persistent_workers=(
+            DATALOADER_WORKERS > 0
+        ),
     )
 
     validation_loader = DataLoader(
@@ -751,28 +920,52 @@ def get_local_loaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=DATALOADER_WORKERS,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=pin_memory,
         drop_last=False,
+        persistent_workers=(
+            DATALOADER_WORKERS > 0
+        ),
     )
 
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    print()
     print(
-        f"[{participant_id}] Training samples: "
+        f"[{participant_id}] "
+        f"Training samples: "
         f"{len(train_dataset)}"
     )
 
     print(
-        f"[{participant_id}] Validation samples: "
+        f"[{participant_id}] "
+        f"Validation samples: "
         f"{len(validation_dataset)}"
     )
 
     print(
-        f"[{participant_id}] Training batches: "
+        f"[{participant_id}] "
+        f"Training batches: "
         f"{len(train_loader)}"
     )
 
     print(
-        f"[{participant_id}] Validation batches: "
+        f"[{participant_id}] "
+        f"Validation batches: "
         f"{len(validation_loader)}"
+    )
+
+    print(
+        f"[{participant_id}] "
+        f"DataLoader workers: "
+        f"{DATALOADER_WORKERS}"
+    )
+
+    print(
+        f"[{participant_id}] "
+        f"Batch size: "
+        f"{batch_size}"
     )
 
     print(
@@ -780,9 +973,12 @@ def get_local_loaders(
         f"{_audio_cache.stats()}"
     )
 
+    print()
     print(
-        f"[{participant_id}] Local dataset READY."
+        f"[{participant_id}] "
+        "Prepared paired dataset READY."
     )
+    print("=" * 70)
 
     return (
         train_loader,
@@ -796,19 +992,21 @@ def get_local_loaders(
 
 def get_worker_loader(
     worker_id,
-    num_workers=DEFAULT_WORKERS if "DEFAULT_WORKERS" in globals() else 2,
+    num_workers=2,
     batch_size=BATCH_SIZE,
 ):
     """
     Compatibility helper for older code.
-
-    Returns the training loader only.
     """
 
-    train_loader, _ = get_local_loaders(
-        participant_id=f"WORKER {worker_id}",
-        batch_size=batch_size,
-        max_samples=None,
+    train_loader, _ = (
+        get_local_loaders(
+            participant_id=(
+                f"WORKER {worker_id}"
+            ),
+            batch_size=batch_size,
+            max_samples=None,
+        )
     )
 
     return train_loader
